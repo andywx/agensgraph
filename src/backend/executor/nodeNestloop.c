@@ -3,7 +3,7 @@
  * nodeNestloop.c
  *	  routines to support nest-loop joins
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,10 +23,20 @@
 
 #include "access/xact.h"
 #include "executor/execdebug.h"
+#include "executor/nodeModifyGraph.h"
 #include "executor/nodeNestloop.h"
+#include "miscadmin.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
+
+
+typedef struct NestLoopContext
+{
+	dlist_node	list;
+	TupleTableSlot *outer_tupleslot;
+	HeapTuple	outer_tuple;
+} NestLoopContext;
 
 
 /* ----------------------------------------------------------------
@@ -59,18 +69,21 @@
  *			   are prepared to return the first tuple.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
-ExecNestLoop(NestLoopState *node)
+static TupleTableSlot *
+ExecNestLoop(PlanState *pstate)
 {
+	NestLoopState *node = castNode(NestLoopState, pstate);
 	NestLoop   *nl;
 	PlanState  *innerPlan;
 	PlanState  *outerPlan;
 	TupleTableSlot *outerTupleSlot;
 	TupleTableSlot *innerTupleSlot;
-	List	   *joinqual;
-	List	   *otherqual;
+	ExprState  *joinqual;
+	ExprState  *otherqual;
 	ExprContext *econtext;
 	ListCell   *lc;
+
+	CHECK_FOR_INTERRUPTS();
 
 	/*
 	 * get information from the node
@@ -85,26 +98,8 @@ ExecNestLoop(NestLoopState *node)
 	econtext = node->js.ps.ps_ExprContext;
 
 	/*
-	 * Check to see if we're still projecting out tuples from a previous join
-	 * tuple (because there is a function-returning-set in the projection
-	 * expressions).  If so, try to project another one.
-	 */
-	if (node->js.ps.ps_TupFromTlist)
-	{
-		TupleTableSlot *result;
-		ExprDoneCond isDone;
-
-		result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
-		if (isDone == ExprMultipleResult)
-			return result;
-		/* Done with that source tuple... */
-		node->js.ps.ps_TupFromTlist = false;
-	}
-
-	/*
 	 * Reset per-tuple memory context to free any expression evaluation
-	 * storage allocated in the previous tuple cycle.  Note this can't happen
-	 * until we're done projecting out tuples from a join tuple.
+	 * storage allocated in the previous tuple cycle.
 	 */
 	ResetExprContext(econtext);
 
@@ -116,7 +111,7 @@ ExecNestLoop(NestLoopState *node)
 
 	for (;;)
 	{
-		Snapshot svSnapshot = NULL;
+		CommandId	svCid = InvalidCommandId;
 
 		/*
 		 * If we don't have an outer tuple, get the next one and reset the
@@ -176,22 +171,18 @@ ExecNestLoop(NestLoopState *node)
 		 */
 		ENL1_printf("getting new inner tuple");
 
-		if (node->js.jointype == JOIN_CYPHER_MERGE)
+		if (node->js.jointype == JOIN_CYPHER_MERGE ||
+			node->js.jointype == JOIN_CYPHER_DELETE)
 		{
-			/* Increase CommandId to scan modified tuples. */
-			while (node->nl_MergeMatchSnapshot->curcid <=
-												GetCurrentCommandId(false))
-				node->nl_MergeMatchSnapshot->curcid++;
-
-			svSnapshot = innerPlan->state->es_snapshot;
-			innerPlan->state->es_snapshot = node->nl_MergeMatchSnapshot;
+			svCid = innerPlan->state->es_snapshot->curcid;
+			innerPlan->state->es_snapshot->curcid = node->nl_graphwrite_cid;
 		}
 
 		innerTupleSlot = ExecProcNode(innerPlan);
 		econtext->ecxt_innertuple = innerTupleSlot;
 
-		if (svSnapshot != NULL)
-			innerPlan->state->es_snapshot = svSnapshot;
+		if (svCid != InvalidCommandId)
+			innerPlan->state->es_snapshot->curcid = svCid;
 
 		if (TupIsNull(innerTupleSlot))
 		{
@@ -202,6 +193,7 @@ ExecNestLoop(NestLoopState *node)
 			if (!node->nl_MatchedOuter &&
 				(node->js.jointype == JOIN_LEFT ||
 				 node->js.jointype == JOIN_CYPHER_MERGE ||
+				 node->js.jointype == JOIN_CYPHER_DELETE ||
 				 node->js.jointype == JOIN_ANTI))
 			{
 				/*
@@ -214,26 +206,16 @@ ExecNestLoop(NestLoopState *node)
 
 				ENL1_printf("testing qualification for outer-join tuple");
 
-				if (otherqual == NIL || ExecQual(otherqual, econtext, false))
+				if (otherqual == NULL || ExecQual(otherqual, econtext))
 				{
 					/*
 					 * qualification was satisfied so we project and return
 					 * the slot containing the result tuple using
 					 * ExecProject().
 					 */
-					TupleTableSlot *result;
-					ExprDoneCond isDone;
-
 					ENL1_printf("qualification succeeded, projecting tuple");
 
-					result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
-
-					if (isDone != ExprEndResult)
-					{
-						node->js.ps.ps_TupFromTlist =
-							(isDone == ExprMultipleResult);
-						return result;
-					}
+					return ExecProject(node->js.ps.ps_ProjInfo);
 				}
 				else
 					InstrCountFiltered2(node, 1);
@@ -255,7 +237,7 @@ ExecNestLoop(NestLoopState *node)
 		 */
 		ENL1_printf("testing qualification");
 
-		if (ExecQual(joinqual, econtext, false))
+		if (ExecQual(joinqual, econtext))
 		{
 			node->nl_MatchedOuter = true;
 
@@ -267,31 +249,22 @@ ExecNestLoop(NestLoopState *node)
 			}
 
 			/*
-			 * In a semijoin, we'll consider returning the first match, but
-			 * after that we're done with this outer tuple.
+			 * If we only need to join to the first matching inner tuple, then
+			 * consider returning this one, but after that continue with next
+			 * outer tuple.
 			 */
-			if (node->js.jointype == JOIN_SEMI)
+			if (node->js.single_match)
 				node->nl_NeedNewOuter = true;
 
-			if (otherqual == NIL || ExecQual(otherqual, econtext, false))
+			if (otherqual == NULL || ExecQual(otherqual, econtext))
 			{
 				/*
 				 * qualification was satisfied so we project and return the
 				 * slot containing the result tuple using ExecProject().
 				 */
-				TupleTableSlot *result;
-				ExprDoneCond isDone;
-
 				ENL1_printf("qualification succeeded, projecting tuple");
 
-				result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
-
-				if (isDone != ExprEndResult)
-				{
-					node->js.ps.ps_TupFromTlist =
-						(isDone == ExprMultipleResult);
-					return result;
-				}
+				return ExecProject(node->js.ps.ps_ProjInfo);
 			}
 			else
 				InstrCountFiltered2(node, 1);
@@ -316,7 +289,7 @@ NestLoopState *
 ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 {
 	NestLoopState *nlstate;
-	Snapshot	svSnapshot = NULL;
+	CommandId	svCid = InvalidCommandId;
 
 	/* check for unsupported flags */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
@@ -330,6 +303,7 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	nlstate = makeNode(NestLoopState);
 	nlstate->js.ps.plan = (Plan *) node;
 	nlstate->js.ps.state = estate;
+	nlstate->js.ps.ExecProcNode = ExecNestLoop;
 
 	/*
 	 * Miscellaneous initialization
@@ -341,16 +315,11 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	/*
 	 * initialize child expressions
 	 */
-	nlstate->js.ps.targetlist = (List *)
-		ExecInitExpr((Expr *) node->join.plan.targetlist,
-					 (PlanState *) nlstate);
-	nlstate->js.ps.qual = (List *)
-		ExecInitExpr((Expr *) node->join.plan.qual,
-					 (PlanState *) nlstate);
+	nlstate->js.ps.qual =
+		ExecInitQual(node->join.plan.qual, (PlanState *) nlstate);
 	nlstate->js.jointype = node->join.jointype;
-	nlstate->js.joinqual = (List *)
-		ExecInitExpr((Expr *) node->join.joinqual,
-					 (PlanState *) nlstate);
+	nlstate->js.joinqual =
+		ExecInitQual(node->join.joinqual, (PlanState *) nlstate);
 
 	/*
 	 * initialize child nodes
@@ -367,30 +336,37 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	else
 		eflags &= ~EXEC_FLAG_REWIND;
 
-	if (node->join.jointype == JOIN_CYPHER_MERGE)
+	if (node->join.jointype == JOIN_CYPHER_MERGE ||
+		node->join.jointype == JOIN_CYPHER_DELETE)
 	{
-		Snapshot snapshot;
+		/*
+		 * Modify the CID to see the graph pattern created by MERGE CREATE
+		 * or to not see it deleted by DELETE.
+		 */
+		nlstate->nl_graphwrite_cid =
+						estate->es_snapshot->curcid + MODIFY_CID_NLJOIN_MATCH;
 
-		/* Modify the cid to see the pattern created by MERGE CREATE. */
-
-		snapshot = RegisterCopiedSnapshot(estate->es_snapshot);
-		snapshot->curcid = estate->es_output_cid + 1;
-		nlstate->nl_MergeMatchSnapshot = snapshot;
-
-		svSnapshot = estate->es_snapshot;
-		estate->es_snapshot = nlstate->nl_MergeMatchSnapshot;
+		svCid = estate->es_snapshot->curcid;
+		estate->es_snapshot->curcid = nlstate->nl_graphwrite_cid;
 	}
 
 	innerPlanState(nlstate) = ExecInitNode(innerPlan(node), estate, eflags);
 
-	if (svSnapshot != NULL)
-		estate->es_snapshot = svSnapshot;
+	if (svCid != InvalidCommandId)
+		estate->es_snapshot->curcid = svCid;
 
 	/*
 	 * tuple table initialization
 	 */
 	ExecInitResultTupleSlot(estate, &nlstate->js.ps);
 
+	/*
+	 * detect whether we need only consider the first matching inner tuple
+	 */
+	nlstate->js.single_match = (node->join.inner_unique ||
+								node->join.jointype == JOIN_SEMI);
+
+	/* set up null tuples for outer joins, if needed */
 	switch (node->join.jointype)
 	{
 		case JOIN_INNER:
@@ -400,9 +376,10 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 		case JOIN_LEFT:
 		case JOIN_ANTI:
 		case JOIN_CYPHER_MERGE:
+		case JOIN_CYPHER_DELETE:
 			nlstate->nl_NullInnerTupleSlot =
 				ExecInitNullTupleSlot(estate,
-								 ExecGetResultType(innerPlanState(nlstate)));
+									  ExecGetResultType(innerPlanState(nlstate)));
 			break;
 		default:
 			elog(ERROR, "unrecognized join type: %d",
@@ -415,10 +392,12 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&nlstate->js.ps);
 	ExecAssignProjectionInfo(&nlstate->js.ps, NULL);
 
+	dlist_init(&nlstate->ctxs_head);
+	nlstate->prev_ctx_node = &nlstate->ctxs_head.head;
+
 	/*
 	 * finally, wipe the current outer tuple clean.
 	 */
-	nlstate->js.ps.ps_TupFromTlist = false;
 	nlstate->nl_NeedNewOuter = true;
 	nlstate->nl_MatchedOuter = false;
 
@@ -437,6 +416,8 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 void
 ExecEndNestLoop(NestLoopState *node)
 {
+	dlist_mutable_iter iter;
+
 	NL1_printf("ExecEndNestLoop: %s\n",
 			   "ending node processing");
 
@@ -450,13 +431,22 @@ ExecEndNestLoop(NestLoopState *node)
 	 */
 	ExecClearTuple(node->js.ps.ps_ResultTupleSlot);
 
+	dlist_foreach_modify(iter, &node->ctxs_head)
+	{
+		NestLoopContext *ctx;
+
+		dlist_delete(iter.cur);
+
+		ctx = dlist_container(NestLoopContext, list, iter.cur);
+		pfree(ctx);
+	}
+	node->prev_ctx_node = &node->ctxs_head.head;
+
 	/*
 	 * close down subplans
 	 */
 	ExecEndNode(outerPlanState(node));
 	ExecEndNode(innerPlanState(node));
-
-	UnregisterSnapshot(node->nl_MergeMatchSnapshot);
 
 	NL1_printf("ExecEndNestLoop: %s\n",
 			   "node processing ended");
@@ -484,7 +474,153 @@ ExecReScanNestLoop(NestLoopState *node)
 	 * outer Vars are used as run-time keys...
 	 */
 
-	node->js.ps.ps_TupFromTlist = false;
 	node->nl_NeedNewOuter = true;
 	node->nl_MatchedOuter = false;
+}
+
+void
+ExecNextNestLoopContext(NestLoopState *node)
+{
+	ExprContext *econtext = node->js.ps.ps_ExprContext;
+	dlist_node *ctx_node;
+	NestLoopContext *ctx;
+	TupleTableSlot *slot;
+
+	/*
+	 * This nested loop is supposed to be for vertex-edge join to get vertices
+	 * for graphpath results, and that means it is the top most (and only)
+	 * innerPlan of NestLoopVLE. Since it is already executed at this point,
+	 * its chgParam is already NULL. So, we don't need to manage chgParam.
+	 */
+	Assert(node->js.ps.chgParam == NULL);
+	Assert(node->js.jointype == JOIN_INNER);
+
+	/* get the current context */
+	if (dlist_has_next(&node->ctxs_head, node->prev_ctx_node))
+	{
+		ctx_node = dlist_next_node(&node->ctxs_head, node->prev_ctx_node);
+		ctx = dlist_container(NestLoopContext, list, ctx_node);
+	}
+	else
+	{
+		ctx = palloc(sizeof(*ctx));
+		ctx_node = &ctx->list;
+
+		dlist_push_tail(&node->ctxs_head, ctx_node);
+	}
+
+	slot = econtext->ecxt_outertuple;
+	if (TTS_HAS_PHYSICAL_TUPLE(slot) && slot->tts_tuple == ctx->outer_tuple)
+	{
+		/*
+		 * If tts_tuple is the same with the stored one, remove it from the
+		 * slot to keep this copy from ExecStoreTuple()/ExecClearTuple() in
+		 * the next nested loop.
+		 *
+		 * This can happen when there is a matched result with the tuple.
+		 */
+		slot->tts_isempty = true;
+		slot->tts_tuple = NULL;
+		slot->tts_shouldFree = false;
+	}
+	else
+	{
+		/*
+		 * Keep the latest outer tuple slot to 1) set ecxt_outertuple to it
+		 * later when continuing the current nested loop after the end of the
+		 * next nested loop, and 2) use the original slot rather than a
+		 * temporary slot that requires extra resources.
+		 * We get the slot through ecxt_outertuple instead of
+		 * outerPlanState(node)->ps_ResultTupleSlot because
+		 * outerPlanState(node) can be AppendState.
+		 */
+		ctx->outer_tupleslot = slot;
+		/*
+		 * We need to copy and store the current outer tuple here because;
+		 * 1) there might be a chance to unpin the underlying buffer that the
+		 *    slot relies on while doing ExecStoreTuple() in the next nested
+		 *    loop, and
+		 * 2) when continuing the current nested loop later, the inner plan
+		 *    needs the right outer variables that are in the slot.
+		 * The tuple has to be stored in CurrentMemoryContext.
+		 */
+		ctx->outer_tuple = ExecCopySlotTuple(slot);
+	}
+	/*
+	 * We don't need to care about the inner plan and nl_NeedNewOuter because
+	 * the next execution of the current nested loop must execute the inner
+	 * plan.
+	 */
+
+	/* make the current context previous context */
+	node->prev_ctx_node = ctx_node;
+
+	/*
+	 * We don't have to restore the current outer tuple slot because it will be
+	 * filled with values of the first scan result of the outer plan.
+	 */
+
+	ExecNextContext(outerPlanState(node));
+	ExecNextContext(innerPlanState(node));
+
+	node->nl_NeedNewOuter = true;
+}
+
+void
+ExecPrevNestLoopContext(NestLoopState *node)
+{
+	NestLoop   *nl = (NestLoop *) node->js.ps.plan;
+	ExprContext *econtext = node->js.ps.ps_ExprContext;
+	dlist_node *ctx_node;
+	NestLoopContext *ctx;
+	TupleTableSlot *slot;
+	ListCell   *lc;
+
+	/*
+	 * We don't have to store the current outer tuple slot because of the same
+	 * reason above.
+	 */
+
+	/* make the previous context current context */
+	ctx_node = node->prev_ctx_node;
+	Assert(ctx_node != &node->ctxs_head.head);
+
+	if (dlist_has_prev(&node->ctxs_head, ctx_node))
+		node->prev_ctx_node = dlist_prev_node(&node->ctxs_head, ctx_node);
+	else
+		node->prev_ctx_node = &node->ctxs_head.head;
+
+	ctx = dlist_container(NestLoopContext, list, ctx_node);
+	slot = ctx->outer_tupleslot;
+	econtext->ecxt_outertuple = slot;
+	/*
+	 * Pass true to shouldFree here because the tuple must be freed when
+	 * ExecStoreTuple(), ExecClearTuple(), or ExecResetTupleTable() is called.
+	 */
+	ExecStoreTuple(ctx->outer_tuple, slot, InvalidBuffer, true);
+	/* restore outer variables */
+	foreach(lc, nl->nestParams)
+	{
+		NestLoopParam *nlp = (NestLoopParam *) lfirst(lc);
+		int			paramno = nlp->paramno;
+		ParamExecData *prm;
+
+		prm = &(econtext->ecxt_param_exec_vals[paramno]);
+		/* Param value should be an OUTER_VAR var */
+		Assert(IsA(nlp->paramval, Var));
+		Assert(nlp->paramval->varno == OUTER_VAR);
+		Assert(nlp->paramval->varattno > 0);
+		prm->value = slot_getattr(slot,
+								  nlp->paramval->varattno,
+								  &(prm->isnull));
+	}
+
+	ExecPrevContext(outerPlanState(node));
+	ExecPrevContext(innerPlanState(node));
+
+	/*
+	 * The next execution of the current nested loop must execute the inner
+	 * plan.
+	 */
+	node->nl_NeedNewOuter = false;
 }

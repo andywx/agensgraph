@@ -25,6 +25,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_inherits_fn.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/toasting.h"
 #include "commands/event_trigger.h"
@@ -32,6 +33,7 @@
 #include "commands/schemacmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
+#include "executor/spi.h"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_utilcmd.h"
@@ -41,20 +43,22 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-static ObjectAddress DefineLabel(CreateStmt *stmt, char labkind);
+static ObjectAddress DefineLabel(CreateStmt *stmt, char labkind,
+								 const char *queryString);
 static void GetSuperOids(List *supers, char labkind, List **supOids);
 static void AgInheritanceDependancy(Oid laboid, List *supers);
 static void SetMaxStatisticsTarget(Oid laboid);
 
 /* See ProcessUtilitySlow() case T_CreateSchemaStmt */
 void
-CreateGraphCommand(CreateGraphStmt *stmt, const char *queryString)
+CreateGraphCommand(CreateGraphStmt *stmt, const char *queryString,
+				   int stmt_location, int stmt_len)
 {
 	Oid			graphid;
 	List	   *parsetree_list;
 	ListCell   *parsetree_item;
 
-	graphid = GraphCreate(stmt, queryString);
+	graphid = GraphCreate(stmt, queryString, stmt_location, stmt_len);
 	if (!OidIsValid(graphid))
 		return;
 
@@ -64,14 +68,18 @@ CreateGraphCommand(CreateGraphStmt *stmt, const char *queryString)
 
 	foreach(parsetree_item, parsetree_list)
 	{
-		Node *stmt = lfirst(parsetree_item);
+		Node	   *stmt = lfirst(parsetree_item);
+		PlannedStmt *wrapper;
 
-		ProcessUtility(stmt,
-					   queryString,
-					   PROCESS_UTILITY_SUBCOMMAND,
-					   NULL,
-					   None_Receiver,
-					   NULL);
+		wrapper = makeNode(PlannedStmt);
+		wrapper->commandType = CMD_UTILITY;
+		wrapper->canSetTag = false;
+		wrapper->utilityStmt = stmt;
+		wrapper->stmt_location = stmt_location;
+		wrapper->stmt_len = stmt_len;
+
+		ProcessUtility(wrapper, queryString, PROCESS_UTILITY_SUBCOMMAND,
+					   NULL, NULL, None_Receiver, NULL);
 
 		CommandCounterIncrement();
 	}
@@ -136,8 +144,7 @@ RenameGraph(const char *oldname, const char *newname)
 
 	/* rename */
 	namestrcpy(&(((Form_ag_graph) GETSTRUCT(tup))->graphname), newname);
-	simple_heap_update(rel, &tup->t_self, tup);
-	CatalogUpdateIndexes(rel, tup);
+	CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 	InvokeObjectPostAlterHook(GraphRelationId, HeapTupleGetOid(tup), 0);
 
@@ -156,7 +163,7 @@ RenameGraph(const char *oldname, const char *newname)
 /* See ProcessUtilitySlow() case T_CreateStmt */
 void
 CreateLabelCommand(CreateLabelStmt *labelStmt, const char *queryString,
-				   ParamListInfo params)
+				   int stmt_location, int stmt_len, ParamListInfo params)
 {
 	char		labkind;
 	List	   *stmts;
@@ -174,16 +181,26 @@ CreateLabelCommand(CreateLabelStmt *labelStmt, const char *queryString,
 
 		if (IsA(stmt, CreateStmt))
 		{
-			DefineLabel((CreateStmt *) stmt, labkind);
+			DefineLabel((CreateStmt *) stmt, labkind, queryString);
 		}
 		else
 		{
+			PlannedStmt *wrapper;
+
 			/*
 			 * Recurse for anything else.  Note the recursive call will stash
 			 * the objects so created into our event trigger context.
 			 */
-			ProcessUtility(stmt, queryString, PROCESS_UTILITY_SUBCOMMAND,
-						   params, None_Receiver, NULL);
+
+			wrapper = makeNode(PlannedStmt);
+			wrapper->commandType = CMD_UTILITY;
+			wrapper->canSetTag = false;
+			wrapper->utilityStmt = stmt;
+			wrapper->stmt_location = stmt_location;
+			wrapper->stmt_len = stmt_len;
+
+			ProcessUtility(wrapper, queryString, PROCESS_UTILITY_SUBCOMMAND,
+						   params, NULL, None_Receiver, NULL);
 		}
 
 		CommandCounterIncrement();
@@ -192,7 +209,7 @@ CreateLabelCommand(CreateLabelStmt *labelStmt, const char *queryString,
 
 /* creates a new graph label */
 static ObjectAddress
-DefineLabel(CreateStmt *stmt, char labkind)
+DefineLabel(CreateStmt *stmt, char labkind, const char *queryString)
 {
 	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
 	ObjectAddress reladdr;
@@ -206,7 +223,8 @@ DefineLabel(CreateStmt *stmt, char labkind)
 	 * Create the table
 	 */
 
-	reladdr = DefineRelation(stmt, RELKIND_RELATION, InvalidOid, NULL);
+	reladdr = DefineRelation(stmt, RELKIND_RELATION, InvalidOid, NULL,
+							 queryString);
 	EventTriggerCollectSimpleCommand(reladdr, InvalidObjectAddress,
 									 (Node *) stmt);
 
@@ -274,9 +292,7 @@ SetMaxStatisticsTarget(Oid laboid)
 	attrtuple = (Form_pg_attribute) GETSTRUCT(tuple);
 	attrtuple->attstattarget = maxtarget;
 
-	simple_heap_update(attrelation, &tuple->t_self, tuple);
-
-	CatalogUpdateIndexes(attrelation, tuple);
+	CatalogTupleUpdate(attrelation, &tuple->t_self, tuple);
 
 	heap_freetuple(tuple);
 
@@ -293,9 +309,7 @@ SetMaxStatisticsTarget(Oid laboid)
 
 	attrtuple->attstattarget = maxtarget;
 
-	simple_heap_update(attrelation, &tuple->t_self, tuple);
-
-	CatalogUpdateIndexes(attrelation, tuple);
+	CatalogTupleUpdate(attrelation, &tuple->t_self, tuple);
 
 	heap_freetuple(tuple);
 
@@ -345,13 +359,11 @@ GetSuperOids(List *supers, char labkind, List **supOids)
 static void
 AgInheritanceDependancy(Oid laboid, List *supers)
 {
-	int16		seq;
 	ListCell   *entry;
 
 	if (supers == NIL)
 		return;
 
-	seq = 1;
 	foreach(entry, supers)
 	{
 		Oid parentOid = lfirst_oid(entry);
@@ -365,8 +377,6 @@ AgInheritanceDependancy(Oid laboid, List *supers)
 		parentobject.objectId = parentOid;
 		parentobject.objectSubId = 0;
 		recordDependencyOn(&childobject, &parentobject, DEPENDENCY_NORMAL);
-
-		seq++;
 	}
 }
 
@@ -408,8 +418,7 @@ RenameLabel(RenameStmt *stmt)
 
 	/* rename */
 	namestrcpy(&(((Form_ag_label) GETSTRUCT(tup))->labname), stmt->newname);
-	simple_heap_update(rel, &tup->t_self, tup);
-	CatalogUpdateIndexes(rel, tup);
+	CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 	InvokeObjectPostAlterHook(LabelRelationId, HeapTupleGetOid(tup), 0);
 
@@ -475,9 +484,9 @@ bool
 RangeVarIsLabel(RangeVar *rel)
 {
 	Oid			nspid;
+	Oid			graphid;
 	HeapTuple	nsptuple;
 	Form_pg_namespace nspdata;
-	bool		result;
 
 	nspid = RangeVarGetCreationNamespace(rel);
 	nsptuple = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspid));
@@ -485,27 +494,35 @@ RangeVarIsLabel(RangeVar *rel)
 		elog(ERROR, "cache lookup failed for label (OID=%u)", nspid);
 
 	nspdata = (Form_pg_namespace) GETSTRUCT(nsptuple);
-	result = OidIsValid(get_graphname_oid(NameStr(nspdata->nspname)));
-
+	graphid = get_graphname_oid(NameStr(nspdata->nspname));
 	ReleaseSysCache(nsptuple);
 
-	return result;
+	return OidIsValid(get_labname_laboid(rel->relname, graphid));
 }
 
 void
 CreateConstraintCommand(CreateConstraintStmt *constraintStmt,
-						const char *queryString, ParamListInfo params)
+						const char *queryString, int stmt_location,
+						int stmt_len,ParamListInfo params)
 {
-	Node	   *stmt;
 	ParseState *pstate;
+	Node	   *stmt;
+	PlannedStmt *wrapper;
 
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 
 	stmt = transformCreateConstraintStmt(pstate, constraintStmt);
 
-	ProcessUtility(stmt, queryString, PROCESS_UTILITY_SUBCOMMAND,
-				   params, None_Receiver, NULL);
+	wrapper = makeNode(PlannedStmt);
+	wrapper->commandType = CMD_UTILITY;
+	wrapper->canSetTag = false;
+	wrapper->utilityStmt = stmt;
+	wrapper->stmt_location = stmt_location;
+	wrapper->stmt_len = stmt_len;
+
+	ProcessUtility(wrapper, queryString, PROCESS_UTILITY_SUBCOMMAND,
+				   params, NULL, None_Receiver, NULL);
 
 	CommandCounterIncrement();
 
@@ -514,18 +531,27 @@ CreateConstraintCommand(CreateConstraintStmt *constraintStmt,
 
 void
 DropConstraintCommand(DropConstraintStmt *constraintStmt,
-					  const char *queryString, ParamListInfo params)
+					  const char *queryString, int stmt_location,
+					  int stmt_len,ParamListInfo params)
 {
-	Node	   *stmt;
 	ParseState *pstate;
+	Node	   *stmt;
+	PlannedStmt *wrapper;
 
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 
 	stmt = transformDropConstraintStmt(pstate, constraintStmt);
 
-	ProcessUtility(stmt, queryString, PROCESS_UTILITY_SUBCOMMAND,
-				   params, None_Receiver, NULL);
+	wrapper = makeNode(PlannedStmt);
+	wrapper->commandType = CMD_UTILITY;
+	wrapper->canSetTag = false;
+	wrapper->utilityStmt = stmt;
+	wrapper->stmt_location = stmt_location;
+	wrapper->stmt_len = stmt_len;
+
+	ProcessUtility(wrapper, queryString, PROCESS_UTILITY_SUBCOMMAND,
+				   params, NULL, None_Receiver, NULL);
 
 	CommandCounterIncrement();
 
@@ -550,4 +576,96 @@ DisableIndexCommand(DisableIndexStmt *disableStmt)
 						relation->relname)));
 
 	return relid;
+}
+
+bool
+isEmptyLabel(char *label_name)
+{
+	int			ret;
+	StringInfoData sql;
+	bool		result = true;
+
+	initStringInfo(&sql);
+
+	appendStringInfo(&sql, "SELECT 1 FROM %s.%s LIMIT 1",
+					 quote_identifier(get_graph_path(false)),
+					 quote_identifier(label_name));
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+		elog(ERROR, "isEmptyLabel: SPI_connect returned %d", ret);
+
+	ret = SPI_execute(sql.data, true, 1);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "isEmptyLabel: SPI_execute returned %d: %s",
+			 ret, sql.data);
+
+	if (SPI_processed > 0)
+		result = false;
+
+	ret = SPI_finish();
+	if (ret != SPI_OK_FINISH)
+		elog(ERROR, "isEmptyLabel: SPI_finish returned %d", ret);
+
+	return result;
+}
+
+void
+deleteRelatedEdges(const char *vlab)
+{
+	Labid		vlabid;
+	Oid			graphoid;
+	Oid			agedge;
+	ListCell   *lc;
+	List	   *edges = NIL;
+
+	graphoid = get_graph_path_oid();
+	vlabid = get_labname_labid(vlab, graphoid);
+
+	/* get all edge's relid */
+	agedge = get_laboid_relid(get_labname_laboid(AG_EDGE, graphoid));
+	edges = list_make1_oid(agedge);
+	edges = list_concat(edges, find_all_inheritors(agedge, NoLock, NULL));
+
+	foreach(lc, edges)
+	{
+		Oid			edgeoid = lfirst_oid(lc);
+		Relation	rel;
+		int			ret;
+		StringInfoData sql;
+
+		/* Hold the ShareLock to prevent DML on the edge label */
+		rel = try_relation_open(edgeoid, ShareLock);
+		if (rel == NULL)
+			continue;	/* not exist */
+
+		initStringInfo(&sql);
+
+		appendStringInfo(&sql, "DELETE FROM ONLY %s.%s WHERE "
+				"(start >= graphid(%u,0) AND"
+				" start <= graphid(%u," UINT64_FORMAT ")) OR "
+				"(\"end\" >= graphid(%u,0) AND"
+				" \"end\" <= graphid(%u," UINT64_FORMAT "))",
+				quote_identifier(get_graph_path(false)),
+				quote_identifier(RelationGetRelationName(rel)),
+				vlabid, vlabid, GRAPHID_LOCID_MAX,
+				vlabid, vlabid, GRAPHID_LOCID_MAX);
+
+		ret = SPI_connect();
+		if (ret != SPI_OK_CONNECT)
+			elog(ERROR, "deleteRelatedEdges: SPI_connect returned %d", ret);
+
+		enableGraphDML = true;
+		ret = SPI_execute(sql.data, false, 0);
+		if (ret != SPI_OK_DELETE)
+			elog(ERROR, "deleteRelatedEdges: SPI_execute returned %d: %s",
+				 ret, sql.data);
+		enableGraphDML = false;
+
+		ret = SPI_finish();
+		if (ret != SPI_OK_FINISH)
+			elog(ERROR, "deleteRelatedEdges: SPI_finish returned %d", ret);
+
+		relation_close(rel, ShareLock);
+	}
 }

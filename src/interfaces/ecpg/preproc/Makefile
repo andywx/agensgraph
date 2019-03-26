@@ -2,7 +2,7 @@
 #
 # Makefile for src/interfaces/ecpg/preproc
 #
-# Copyright (c) 1998-2016, PostgreSQL Global Development Group
+# Copyright (c) 1998-2017, PostgreSQL Global Development Group
 #
 # src/interfaces/ecpg/preproc/Makefile
 #
@@ -15,16 +15,11 @@ subdir = src/interfaces/ecpg/preproc
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
-MAJOR_VERSION= 4
-MINOR_VERSION= 12
-PATCHLEVEL=0
-
 override CPPFLAGS := -I../include -I$(top_srcdir)/src/interfaces/ecpg/include \
-	-I. -I$(srcdir) -DMAJOR_VERSION=$(MAJOR_VERSION) \
-	-DMINOR_VERSION=$(MINOR_VERSION) -DPATCHLEVEL=$(PATCHLEVEL) \
+	-I. -I$(srcdir) -DECPG_COMPILE \
 	 $(CPPFLAGS)
 
-override CFLAGS += $(PTHREAD_CFLAGS) -DECPG_COMPILE
+override CFLAGS += $(PTHREAD_CFLAGS)
 
 OBJS=	preproc.o pgc.o type.o ecpg.o output.o parser.o \
 	keywords.o c_keywords.o ecpg_keywords.o ../ecpglib/typename.o descriptor.o variable.o \
@@ -44,7 +39,10 @@ ecpg: $(OBJS) | submake-libpgport
 ../ecpglib/typename.o: ../ecpglib/typename.c
 	$(MAKE) -C $(dir $@) $(notdir $@)
 
-preproc.h: preproc.c ;
+# See notes in src/backend/parser/Makefile about the following two rules
+preproc.h: preproc.c
+	touch $@
+
 preproc.c: BISONFLAGS += -d
 
 preproc.y: ../../../backend/parser/gram.y parse.pl ecpg.addons ecpg.header ecpg.tokens ecpg.trailer ecpg.type

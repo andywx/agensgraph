@@ -4,7 +4,7 @@
  *	  lexical scanning for PL/pgSQL
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,12 +13,14 @@
  *
  *-------------------------------------------------------------------------
  */
-#include "plpgsql.h"
+#include "postgres.h"
 
 #include "mb/pg_wchar.h"
 #include "parser/scanner.h"
 
+#include "plpgsql.h"
 #include "pl_gram.h"			/* must be after parser/scanner.h */
+
 
 #define PG_KEYWORD(a,b,c) {a,b,c},
 
@@ -132,7 +134,9 @@ static const ScanKeyword unreserved_keywords[] = {
 	PG_KEYWORD("insert", K_INSERT, UNRESERVED_KEYWORD)
 	PG_KEYWORD("is", K_IS, UNRESERVED_KEYWORD)
 	PG_KEYWORD("last", K_LAST, UNRESERVED_KEYWORD)
+	PG_KEYWORD("load", K_LOAD, UNRESERVED_KEYWORD)
 	PG_KEYWORD("log", K_LOG, UNRESERVED_KEYWORD)
+	PG_KEYWORD("match", K_MATCH, UNRESERVED_KEYWORD)
 	PG_KEYWORD("message", K_MESSAGE, UNRESERVED_KEYWORD)
 	PG_KEYWORD("message_text", K_MESSAGE_TEXT, UNRESERVED_KEYWORD)
 	PG_KEYWORD("move", K_MOVE, UNRESERVED_KEYWORD)

@@ -3,7 +3,7 @@
  * joinrels.c
  *	  Routines to determine which relations should be joined
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,7 +31,11 @@ static bool has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel);
 static bool is_dummy_rel(RelOptInfo *rel);
 static void mark_dummy_rel(RelOptInfo *rel);
 static bool restriction_is_constant_false(List *restrictlist,
+							  RelOptInfo *joinrel,
 							  bool only_pushed_down);
+static void populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
+							RelOptInfo *rel2, RelOptInfo *joinrel,
+							SpecialJoinInfo *sjinfo, List *restrictlist);
 
 
 /*
@@ -90,7 +94,7 @@ join_search_one_level(PlannerInfo *root, int level)
 
 			if (level == 2)		/* consider remaining initial rels */
 				other_rels = lnext(r);
-			else	/* consider all initial rels */
+			else				/* consider all initial rels */
 				other_rels = list_head(joinrels[1]);
 
 			make_rels_by_clause_joins(root,
@@ -308,6 +312,28 @@ make_rels_by_clauseless_joins(PlannerInfo *root,
 	}
 }
 
+/* This function is used only by the join_is_legal function. */
+static bool
+is_graph_join_rel(RelOptInfo *rel)
+{
+	NestPath   *nlpath;
+
+	if (!(IS_JOIN_REL(rel)))
+		return false;
+
+	/* All of graph join is only used nestloop. */
+	if (!IsA(rel->cheapest_total_path, NestPath))
+		return false;
+	else
+	{
+		nlpath = castNode(NestPath, rel->cheapest_total_path);
+
+		if(IS_GRAPH_JOIN(nlpath->jointype))
+			return true;
+	}
+
+	return false;
+}
 
 /*
  * join_is_legal
@@ -333,6 +359,13 @@ join_is_legal(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 	bool		unique_ified;
 	bool		must_be_leftjoin;
 	ListCell   *l;
+
+	/*
+	 * Because graph joins must not change the join order, prevent to be
+	 * a sub-tree of another join.
+	 */
+	if (is_graph_join_rel(rel1) || is_graph_join_rel(rel2))
+		return false;
 
 	/*
 	 * Ensure output params are set on failure return.  This is just to
@@ -612,7 +645,7 @@ join_is_legal(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 						!bms_is_subset(sjinfo->min_righthand, join_plus_rhs))
 					{
 						join_plus_rhs = bms_add_members(join_plus_rhs,
-													  sjinfo->min_righthand);
+														sjinfo->min_righthand);
 						more = true;
 					}
 					/* full joins constrain both sides symmetrically */
@@ -724,6 +757,27 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		return joinrel;
 	}
 
+	/* Add paths to the join relation. */
+	populate_joinrel_with_paths(root, rel1, rel2, joinrel, sjinfo,
+								restrictlist);
+
+	bms_free(joinrelids);
+
+	return joinrel;
+}
+
+/*
+ * populate_joinrel_with_paths
+ *	  Add paths to the given joinrel for given pair of joining relations. The
+ *	  SpecialJoinInfo provides details about the join and the restrictlist
+ *	  contains the join clauses and the other clauses applicable for given pair
+ *	  of the joining relations.
+ */
+static void
+populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
+							RelOptInfo *rel2, RelOptInfo *joinrel,
+							SpecialJoinInfo *sjinfo, List *restrictlist)
+{
 	/*
 	 * Consider paths using each rel as both outer and inner.  Depending on
 	 * the join type, a provably empty outer or inner rel might mean the join
@@ -746,7 +800,7 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 	{
 		case JOIN_INNER:
 			if (is_dummy_rel(rel1) || is_dummy_rel(rel2) ||
-				restriction_is_constant_false(restrictlist, false))
+				restriction_is_constant_false(restrictlist, joinrel, false))
 			{
 				mark_dummy_rel(joinrel);
 				break;
@@ -760,12 +814,12 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			break;
 		case JOIN_LEFT:
 			if (is_dummy_rel(rel1) ||
-				restriction_is_constant_false(restrictlist, true))
+				restriction_is_constant_false(restrictlist, joinrel, true))
 			{
 				mark_dummy_rel(joinrel);
 				break;
 			}
-			if (restriction_is_constant_false(restrictlist, false) &&
+			if (restriction_is_constant_false(restrictlist, joinrel, false) &&
 				bms_is_subset(rel2->relids, sjinfo->syn_righthand))
 				mark_dummy_rel(rel2);
 			add_paths_to_joinrel(root, joinrel, rel1, rel2,
@@ -777,7 +831,7 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			break;
 		case JOIN_FULL:
 			if ((is_dummy_rel(rel1) && is_dummy_rel(rel2)) ||
-				restriction_is_constant_false(restrictlist, true))
+				restriction_is_constant_false(restrictlist, joinrel, true))
 			{
 				mark_dummy_rel(joinrel);
 				break;
@@ -813,7 +867,7 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 				bms_is_subset(sjinfo->min_righthand, rel2->relids))
 			{
 				if (is_dummy_rel(rel1) || is_dummy_rel(rel2) ||
-					restriction_is_constant_false(restrictlist, false))
+					restriction_is_constant_false(restrictlist, joinrel, false))
 				{
 					mark_dummy_rel(joinrel);
 					break;
@@ -836,7 +890,7 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 								   sjinfo) != NULL)
 			{
 				if (is_dummy_rel(rel1) || is_dummy_rel(rel2) ||
-					restriction_is_constant_false(restrictlist, false))
+					restriction_is_constant_false(restrictlist, joinrel, false))
 				{
 					mark_dummy_rel(joinrel);
 					break;
@@ -851,12 +905,12 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			break;
 		case JOIN_ANTI:
 			if (is_dummy_rel(rel1) ||
-				restriction_is_constant_false(restrictlist, true))
+				restriction_is_constant_false(restrictlist, joinrel, true))
 			{
 				mark_dummy_rel(joinrel);
 				break;
 			}
-			if (restriction_is_constant_false(restrictlist, false) &&
+			if (restriction_is_constant_false(restrictlist, joinrel, false) &&
 				bms_is_subset(rel2->relids, sjinfo->syn_righthand))
 				mark_dummy_rel(rel2);
 			add_paths_to_joinrel(root, joinrel, rel1, rel2,
@@ -865,12 +919,12 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			break;
 		case JOIN_CYPHER_MERGE:
 			if (is_dummy_rel(rel1) ||
-				restriction_is_constant_false(restrictlist, true))
+				restriction_is_constant_false(restrictlist, joinrel, true))
 			{
 				mark_dummy_rel(joinrel);
 				break;
 			}
-			if (restriction_is_constant_false(restrictlist, false) &&
+			if (restriction_is_constant_false(restrictlist, joinrel, false) &&
 				bms_is_subset(rel2->relids, sjinfo->syn_righthand))
 				mark_dummy_rel(rel2);
 			add_paths_for_cmerge(root, joinrel, rel1, rel2,
@@ -878,7 +932,7 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			break;
 		case JOIN_VLE:
 			if (is_dummy_rel(rel1) || is_dummy_rel(rel2) ||
-				restriction_is_constant_false(restrictlist, false))
+				restriction_is_constant_false(restrictlist, joinrel, false))
 			{
 				mark_dummy_rel(joinrel);
 				break;
@@ -886,15 +940,24 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			add_paths_to_joinrel_for_vle(root, joinrel, rel1, rel2,
 										 sjinfo, restrictlist);
 			break;
+		case JOIN_CYPHER_DELETE:
+			if (is_dummy_rel(rel1) ||
+				restriction_is_constant_false(restrictlist, joinrel, true))
+			{
+				mark_dummy_rel(joinrel);
+				break;
+			}
+			if (restriction_is_constant_false(restrictlist, joinrel, false) &&
+				bms_is_subset(rel2->relids, sjinfo->syn_righthand))
+				mark_dummy_rel(rel2);
+			add_paths_for_cdelete(root, joinrel, rel1, rel2, sjinfo->jointype,
+								  sjinfo, restrictlist);
+			break;
 		default:
 			/* other values not expected here */
 			elog(ERROR, "unrecognized join type: %d", (int) sjinfo->jointype);
 			break;
 	}
-
-	bms_free(joinrelids);
-
-	return joinrel;
 }
 
 
@@ -1220,7 +1283,7 @@ mark_dummy_rel(RelOptInfo *rel)
 	rel->partial_pathlist = NIL;
 
 	/* Set up the dummy path */
-	add_path(rel, (Path *) create_append_path(rel, NIL, NULL, 0));
+	add_path(rel, (Path *) create_append_path(rel, NIL, NULL, 0, NIL));
 
 	/* Set or update cheapest_total_path and related fields */
 	set_cheapest(rel);
@@ -1230,18 +1293,21 @@ mark_dummy_rel(RelOptInfo *rel)
 
 
 /*
- * restriction_is_constant_false --- is a restrictlist just FALSE?
+ * restriction_is_constant_false --- is a restrictlist just false?
  *
- * In cases where a qual is provably constant FALSE, eval_const_expressions
+ * In cases where a qual is provably constant false, eval_const_expressions
  * will generally have thrown away anything that's ANDed with it.  In outer
  * join situations this will leave us computing cartesian products only to
  * decide there's no match for an outer row, which is pretty stupid.  So,
  * we need to detect the case.
  *
- * If only_pushed_down is TRUE, then consider only pushed-down quals.
+ * If only_pushed_down is true, then consider only quals that are pushed-down
+ * from the point of view of the joinrel.
  */
 static bool
-restriction_is_constant_false(List *restrictlist, bool only_pushed_down)
+restriction_is_constant_false(List *restrictlist,
+							  RelOptInfo *joinrel,
+							  bool only_pushed_down)
 {
 	ListCell   *lc;
 
@@ -1253,10 +1319,9 @@ restriction_is_constant_false(List *restrictlist, bool only_pushed_down)
 	 */
 	foreach(lc, restrictlist)
 	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-		Assert(IsA(rinfo, RestrictInfo));
-		if (only_pushed_down && !rinfo->is_pushed_down)
+		if (only_pushed_down && !RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
 			continue;
 
 		if (rinfo->clause && IsA(rinfo->clause, Const))

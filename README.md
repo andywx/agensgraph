@@ -25,6 +25,11 @@ Building from the Source Code
         $ dnf install gcc glibc bison flex readline readline-devel zlib zlib-devel
         ```
 
+    * RHEL:
+        ```sh
+        $ yum install gcc glibc glib-common readline readline-devel zlib zlib-devel flex bison
+        ```
+
     * Ubuntu:
         ```sh
         $ sudo apt-get install build-essential libreadline-dev zlib1g-dev flex bison
@@ -58,7 +63,7 @@ Building from the Source Code
         $ echo "export PATH=/path/to/agensgraph/bin:\$PATH" >> ~/.bashrc
         $ echo "export LD_LIBRARY_PATH=/path/to/agensgraph/lib:\$LD_LIBRARY_PATH" >> ~/.bashrc
         ```
-    * Build and install other contrib and external modules:
+    * OPTIONAL: Build and install AgensGraph along with other contrib and external modules (If you want to build AgensGraph alone, run make install. This command builds AgensGraph along with additional extensions):
         ```sh
         $ make install-world
         ```
@@ -70,8 +75,8 @@ Building from the Source Code
 
 Documentation
 -------------
-* [Short Guide](http://bitnine.net/support/documents_backup/quick-start-guide-html)
+* [Short Guide](http://bitnine.net/documentations/quick-guide-1-3.html)
 
 License
 -------
-* [Apache License 2.0](http://www.apache.org/license/LICENSE-2.0.html)
+* [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0)

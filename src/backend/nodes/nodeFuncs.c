@@ -3,8 +3,8 @@
  * nodeFuncs.c
  *		Various general-purpose manipulations of Node trees
  *
- * Portions Copyright (c) 2016, Bitnine Inc.
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2018, Bitnine Inc.
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,7 +30,7 @@ static bool expression_returns_set_walker(Node *node, void *context);
 static int	leftmostLoc(int loc1, int loc2);
 static bool fix_opfuncids_walker(Node *node, void *context);
 static bool planstate_walk_subplans(List *plans, bool (*walker) (),
-												void *context);
+									void *context);
 static bool planstate_walk_members(List *plans, PlanState **planstates,
 					   bool (*walker) (), void *context);
 
@@ -112,8 +112,7 @@ exprType(const Node *expr)
 
 					if (!qtree || !IsA(qtree, Query))
 						elog(ERROR, "cannot get type for untransformed sublink");
-					tent = (TargetEntry *) linitial(qtree->targetList);
-					Assert(IsA(tent, TargetEntry));
+					tent = linitial_node(TargetEntry, qtree->targetList);
 					Assert(!tent->resjunk);
 					type = exprType((Node *) tent->expr);
 					if (sublink->subLinkType == ARRAY_SUBLINK)
@@ -123,7 +122,7 @@ exprType(const Node *expr)
 							ereport(ERROR,
 									(errcode(ERRCODE_UNDEFINED_OBJECT),
 									 errmsg("could not find array type for data type %s",
-							format_type_be(exprType((Node *) tent->expr)))));
+											format_type_be(exprType((Node *) tent->expr)))));
 					}
 				}
 				else if (sublink->subLinkType == MULTIEXPR_SUBLINK)
@@ -154,7 +153,7 @@ exprType(const Node *expr)
 							ereport(ERROR,
 									(errcode(ERRCODE_UNDEFINED_OBJECT),
 									 errmsg("could not find array type for data type %s",
-									format_type_be(subplan->firstColType))));
+											format_type_be(subplan->firstColType))));
 					}
 				}
 				else if (subplan->subLinkType == MULTIEXPR_SUBLINK)
@@ -219,6 +218,9 @@ exprType(const Node *expr)
 		case T_MinMaxExpr:
 			type = ((const MinMaxExpr *) expr)->minmaxtype;
 			break;
+		case T_SQLValueFunction:
+			type = ((const SQLValueFunction *) expr)->type;
+			break;
 		case T_XmlExpr:
 			if (((const XmlExpr *) expr)->op == IS_DOCUMENT)
 				type = BOOLOID;
@@ -245,6 +247,9 @@ exprType(const Node *expr)
 		case T_CurrentOfExpr:
 			type = BOOLOID;
 			break;
+		case T_NextValueExpr:
+			type = ((const NextValueExpr *) expr)->typeId;
+			break;
 		case T_InferenceElem:
 			{
 				const InferenceElem *n = (const InferenceElem *) expr;
@@ -255,14 +260,23 @@ exprType(const Node *expr)
 		case T_PlaceHolderVar:
 			type = exprType((Node *) ((const PlaceHolderVar *) expr)->phexpr);
 			break;
-		case T_EdgeRefProp:
+		case T_CypherTypeCast:
+			type = ((const CypherTypeCast *) expr)->type;
+			break;
+		case T_CypherMapExpr:
 			type = JSONBOID;
 			break;
-		case T_EdgeRefRow:
-			type = EDGEOID;
+		case T_CypherListExpr:
+			type = JSONBOID;
 			break;
-		case T_EdgeRefRows:
-			type = EDGEARRAYOID;
+		case T_CypherListCompExpr:
+			type = JSONBOID;
+			break;
+		case T_CypherListCompVar:
+			type = JSONBOID;
+			break;
+		case T_CypherAccessExpr:
+			type = JSONBOID;
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
@@ -329,8 +343,7 @@ exprTypmod(const Node *expr)
 
 					if (!qtree || !IsA(qtree, Query))
 						elog(ERROR, "cannot get type for untransformed sublink");
-					tent = (TargetEntry *) linitial(qtree->targetList);
-					Assert(IsA(tent, TargetEntry));
+					tent = linitial_node(TargetEntry, qtree->targetList);
 					Assert(!tent->resjunk);
 					return exprTypmod((Node *) tent->expr);
 					/* note we don't need to care if it's an array */
@@ -388,9 +401,8 @@ exprTypmod(const Node *expr)
 					return -1;	/* no point in trying harder */
 				foreach(arg, cexpr->args)
 				{
-					CaseWhen   *w = (CaseWhen *) lfirst(arg);
+					CaseWhen   *w = lfirst_node(CaseWhen, arg);
 
-					Assert(IsA(w, CaseWhen));
 					if (exprType((Node *) w->result) != casetype)
 						return -1;
 					if (exprTypmod((Node *) w->result) != typmod)
@@ -489,6 +501,8 @@ exprTypmod(const Node *expr)
 				return typmod;
 			}
 			break;
+		case T_SQLValueFunction:
+			return ((const SQLValueFunction *) expr)->typmod;
 		case T_CoerceToDomain:
 			return ((const CoerceToDomain *) expr)->resulttypmod;
 		case T_CoerceToDomainValue:
@@ -497,9 +511,17 @@ exprTypmod(const Node *expr)
 			return ((const SetToDefault *) expr)->typeMod;
 		case T_PlaceHolderVar:
 			return exprTypmod((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-		case T_EdgeRefProp:
-		case T_EdgeRefRow:
-		case T_EdgeRefRows:
+		case T_CypherTypeCast:
+			return -1;
+		case T_CypherMapExpr:
+			return -1;
+		case T_CypherListExpr:
+			return -1;
+		case T_CypherListCompExpr:
+			return -1;
+		case T_CypherListCompVar:
+			return -1;
+		case T_CypherAccessExpr:
 			return -1;
 		default:
 			break;
@@ -703,36 +725,10 @@ expression_returns_set_walker(Node *node, void *context)
 		/* else fall through to check args */
 	}
 
-	/* Avoid recursion for some cases that can't return a set */
+	/* Avoid recursion for some cases that parser checks not to return a set */
 	if (IsA(node, Aggref))
 		return false;
 	if (IsA(node, WindowFunc))
-		return false;
-	if (IsA(node, DistinctExpr))
-		return false;
-	if (IsA(node, NullIfExpr))
-		return false;
-	if (IsA(node, ScalarArrayOpExpr))
-		return false;
-	if (IsA(node, BoolExpr))
-		return false;
-	if (IsA(node, SubLink))
-		return false;
-	if (IsA(node, SubPlan))
-		return false;
-	if (IsA(node, AlternativeSubPlan))
-		return false;
-	if (IsA(node, ArrayExpr))
-		return false;
-	if (IsA(node, RowExpr))
-		return false;
-	if (IsA(node, RowCompareExpr))
-		return false;
-	if (IsA(node, CoalesceExpr))
-		return false;
-	if (IsA(node, MinMaxExpr))
-		return false;
-	if (IsA(node, XmlExpr))
 		return false;
 
 	return expression_tree_walker(node, expression_returns_set_walker,
@@ -816,8 +812,7 @@ exprCollation(const Node *expr)
 
 					if (!qtree || !IsA(qtree, Query))
 						elog(ERROR, "cannot get collation for untransformed sublink");
-					tent = (TargetEntry *) linitial(qtree->targetList);
-					Assert(IsA(tent, TargetEntry));
+					tent = linitial_node(TargetEntry, qtree->targetList);
 					Assert(!tent->resjunk);
 					coll = exprCollation((Node *) tent->expr);
 					/* collation doesn't change if it's converted to array */
@@ -897,6 +892,9 @@ exprCollation(const Node *expr)
 		case T_MinMaxExpr:
 			coll = ((const MinMaxExpr *) expr)->minmaxcollid;
 			break;
+		case T_SQLValueFunction:
+			coll = InvalidOid;	/* all cases return non-collatable types */
+			break;
 		case T_XmlExpr:
 
 			/*
@@ -927,15 +925,31 @@ exprCollation(const Node *expr)
 		case T_CurrentOfExpr:
 			coll = InvalidOid;	/* result is always boolean */
 			break;
+		case T_NextValueExpr:
+			coll = InvalidOid;	/* result is always an integer type */
+			break;
 		case T_InferenceElem:
 			coll = exprCollation((Node *) ((const InferenceElem *) expr)->expr);
 			break;
 		case T_PlaceHolderVar:
 			coll = exprCollation((Node *) ((const PlaceHolderVar *) expr)->phexpr);
 			break;
-		case T_EdgeRefProp:
-		case T_EdgeRefRow:
-		case T_EdgeRefRows:
+		case T_CypherTypeCast:
+			coll = InvalidOid;
+			break;
+		case T_CypherMapExpr:
+			coll = InvalidOid;
+			break;
+		case T_CypherListExpr:
+			coll = InvalidOid;
+			break;
+		case T_CypherListCompExpr:
+			coll = InvalidOid;
+			break;
+		case T_CypherListCompVar:
+			coll = InvalidOid;
+			break;
+		case T_CypherAccessExpr:
 			coll = InvalidOid;
 			break;
 		default:
@@ -1042,10 +1056,10 @@ exprSetCollation(Node *expr, Oid collation)
 			((NullIfExpr *) expr)->opcollid = collation;
 			break;
 		case T_ScalarArrayOpExpr:
-			Assert(!OidIsValid(collation));		/* result is always boolean */
+			Assert(!OidIsValid(collation)); /* result is always boolean */
 			break;
 		case T_BoolExpr:
-			Assert(!OidIsValid(collation));		/* result is always boolean */
+			Assert(!OidIsValid(collation)); /* result is always boolean */
 			break;
 		case T_SubLink:
 #ifdef USE_ASSERT_CHECKING
@@ -1061,8 +1075,7 @@ exprSetCollation(Node *expr, Oid collation)
 
 					if (!qtree || !IsA(qtree, Query))
 						elog(ERROR, "cannot set collation for untransformed sublink");
-					tent = (TargetEntry *) linitial(qtree->targetList);
-					Assert(IsA(tent, TargetEntry));
+					tent = linitial_node(TargetEntry, qtree->targetList);
 					Assert(!tent->resjunk);
 					Assert(collation == exprCollation((Node *) tent->expr));
 				}
@@ -1072,13 +1085,13 @@ exprSetCollation(Node *expr, Oid collation)
 					Assert(!OidIsValid(collation));
 				}
 			}
-#endif   /* USE_ASSERT_CHECKING */
+#endif							/* USE_ASSERT_CHECKING */
 			break;
 		case T_FieldSelect:
 			((FieldSelect *) expr)->resultcollid = collation;
 			break;
 		case T_FieldStore:
-			Assert(!OidIsValid(collation));		/* result is always composite */
+			Assert(!OidIsValid(collation)); /* result is always composite */
 			break;
 		case T_RelabelType:
 			((RelabelType *) expr)->resultcollid = collation;
@@ -1090,7 +1103,7 @@ exprSetCollation(Node *expr, Oid collation)
 			((ArrayCoerceExpr *) expr)->resultcollid = collation;
 			break;
 		case T_ConvertRowtypeExpr:
-			Assert(!OidIsValid(collation));		/* result is always composite */
+			Assert(!OidIsValid(collation)); /* result is always composite */
 			break;
 		case T_CaseExpr:
 			((CaseExpr *) expr)->casecollid = collation;
@@ -1099,10 +1112,10 @@ exprSetCollation(Node *expr, Oid collation)
 			((ArrayExpr *) expr)->array_collid = collation;
 			break;
 		case T_RowExpr:
-			Assert(!OidIsValid(collation));		/* result is always composite */
+			Assert(!OidIsValid(collation)); /* result is always composite */
 			break;
 		case T_RowCompareExpr:
-			Assert(!OidIsValid(collation));		/* result is always boolean */
+			Assert(!OidIsValid(collation)); /* result is always boolean */
 			break;
 		case T_CoalesceExpr:
 			((CoalesceExpr *) expr)->coalescecollid = collation;
@@ -1110,16 +1123,19 @@ exprSetCollation(Node *expr, Oid collation)
 		case T_MinMaxExpr:
 			((MinMaxExpr *) expr)->minmaxcollid = collation;
 			break;
+		case T_SQLValueFunction:
+			Assert(!OidIsValid(collation)); /* no collatable results */
+			break;
 		case T_XmlExpr:
 			Assert((((XmlExpr *) expr)->op == IS_XMLSERIALIZE) ?
 				   (collation == DEFAULT_COLLATION_OID) :
 				   (collation == InvalidOid));
 			break;
 		case T_NullTest:
-			Assert(!OidIsValid(collation));		/* result is always boolean */
+			Assert(!OidIsValid(collation)); /* result is always boolean */
 			break;
 		case T_BooleanTest:
-			Assert(!OidIsValid(collation));		/* result is always boolean */
+			Assert(!OidIsValid(collation)); /* result is always boolean */
 			break;
 		case T_CoerceToDomain:
 			((CoerceToDomain *) expr)->resultcollid = collation;
@@ -1131,11 +1147,28 @@ exprSetCollation(Node *expr, Oid collation)
 			((SetToDefault *) expr)->collation = collation;
 			break;
 		case T_CurrentOfExpr:
-			Assert(!OidIsValid(collation));		/* result is always boolean */
+			Assert(!OidIsValid(collation)); /* result is always boolean */
 			break;
-		case T_EdgeRefProp:
-		case T_EdgeRefRow:
-		case T_EdgeRefRows:
+		case T_NextValueExpr:
+			Assert(!OidIsValid(collation)); /* result is always an integer
+											 * type */
+			break;
+		case T_CypherTypeCast:
+			/* XXX: Don't care for now */
+			break;
+		case T_CypherMapExpr:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherListExpr:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherListCompExpr:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherListCompVar:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherAccessExpr:
 			Assert(!OidIsValid(collation));
 			break;
 		default:
@@ -1227,6 +1260,9 @@ exprLocation(const Node *expr)
 	{
 		case T_RangeVar:
 			loc = ((const RangeVar *) expr)->location;
+			break;
+		case T_TableFunc:
+			loc = ((const TableFunc *) expr)->location;
 			break;
 		case T_Var:
 			loc = ((const Var *) expr)->location;
@@ -1387,6 +1423,10 @@ exprLocation(const Node *expr)
 		case T_MinMaxExpr:
 			/* GREATEST/LEAST keyword should always be the first thing */
 			loc = ((const MinMaxExpr *) expr)->location;
+			break;
+		case T_SQLValueFunction:
+			/* function keyword should always be the first thing */
+			loc = ((const SQLValueFunction *) expr)->location;
 			break;
 		case T_XmlExpr:
 			{
@@ -1559,6 +1599,46 @@ exprLocation(const Node *expr)
 			/* just use nested expr's location */
 			loc = exprLocation((Node *) ((const InferenceElem *) expr)->expr);
 			break;
+		case T_PartitionElem:
+			loc = ((const PartitionElem *) expr)->location;
+			break;
+		case T_PartitionSpec:
+			loc = ((const PartitionSpec *) expr)->location;
+			break;
+		case T_PartitionBoundSpec:
+			loc = ((const PartitionBoundSpec *) expr)->location;
+			break;
+		case T_PartitionRangeDatum:
+			loc = ((const PartitionRangeDatum *) expr)->location;
+			break;
+		case T_CypherTypeCast:
+			loc = ((const CypherTypeCast *) expr)->location;
+			break;
+		case T_CypherMapExpr:
+			{
+				const CypherMapExpr *m = (const CypherMapExpr *) expr;
+
+				loc = leftmostLoc(m->location,
+								  exprLocation((Node *) m->keyvals));
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				const CypherListExpr *cl = (const CypherListExpr *) expr;
+
+				loc = leftmostLoc(cl->location,
+								  exprLocation((Node *) cl->elems));
+			}
+			break;
+		case T_CypherListCompExpr:
+			loc = exprLocation((Node *) ((CypherListCompExpr *) expr)->list);
+			break;
+		case T_CypherListCompVar:
+			loc = ((CypherListCompVar *) expr)->location;
+			break;
+		case T_CypherAccessExpr:
+			loc = exprLocation((Node *) ((CypherAccessExpr *) expr)->arg);
+			break;
 		default:
 			/* for any other node type it's just unknown... */
 			loc = -1;
@@ -1657,9 +1737,10 @@ set_sa_opfuncid(ScalarArrayOpExpr *opexpr)
  * for themselves, in case additional checks should be made, or because they
  * have special rules about which parts of the tree need to be visited.
  *
- * Note: we ignore MinMaxExpr, XmlExpr, and CoerceToDomain nodes, because they
- * do not contain SQL function OIDs.  However, they can invoke SQL-visible
- * functions, so callers should take thought about how to treat them.
+ * Note: we ignore MinMaxExpr, SQLValueFunction, XmlExpr, CoerceToDomain,
+ * and NextValueExpr nodes, because they do not contain SQL function OIDs.
+ * However, they can invoke SQL-visible functions, so callers should take
+ * thought about how to treat them.
  */
 bool
 check_functions_in_node(Node *node, check_function_callback checker,
@@ -1879,10 +1960,12 @@ expression_tree_walker(Node *node,
 		case T_Var:
 		case T_Const:
 		case T_Param:
-		case T_CoerceToDomainValue:
 		case T_CaseTestExpr:
+		case T_SQLValueFunction:
+		case T_CoerceToDomainValue:
 		case T_SetToDefault:
 		case T_CurrentOfExpr:
+		case T_NextValueExpr:
 		case T_RangeTblRef:
 		case T_SortGroupClause:
 			/* primitive node types with no expression subnodes */
@@ -2049,9 +2132,8 @@ expression_tree_walker(Node *node,
 				/* we assume walker doesn't care about CaseWhens, either */
 				foreach(temp, caseexpr->args)
 				{
-					CaseWhen   *when = (CaseWhen *) lfirst(temp);
+					CaseWhen   *when = lfirst_node(CaseWhen, temp);
 
-					Assert(IsA(when, CaseWhen));
 					if (walker(when->expr, context))
 						return true;
 					if (walker(when->result, context))
@@ -2216,14 +2298,90 @@ expression_tree_walker(Node *node,
 					return true;
 			}
 			break;
-		case T_EdgeRefProp:
-			return walker(((EdgeRefProp *) node)->arg, context);
+		case T_TableFunc:
+			{
+				TableFunc  *tf = (TableFunc *) node;
+
+				if (walker(tf->ns_uris, context))
+					return true;
+				if (walker(tf->docexpr, context))
+					return true;
+				if (walker(tf->rowexpr, context))
+					return true;
+				if (walker(tf->colexprs, context))
+					return true;
+				if (walker(tf->coldefexprs, context))
+					return true;
+			}
 			break;
-		case T_EdgeRefRow:
-			return walker(((EdgeRefRow *) node)->arg, context);
+		case T_CypherTypeCast:
+			{
+				CypherTypeCast *tc = (CypherTypeCast *) node;
+
+				if (expression_tree_walker((Node *) tc->arg, walker, context))
+					return true;
+			}
 			break;
-		case T_EdgeRefRows:
-			return walker(((EdgeRefRows *) node)->arg, context);
+		case T_CypherMapExpr:
+			{
+				CypherMapExpr *m = (CypherMapExpr *) node;
+
+				if (expression_tree_walker((Node *) m->keyvals,
+										   walker, context))
+					return true;
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+
+				if (expression_tree_walker((Node *) cl->elems,
+										   walker, context))
+					return true;
+			}
+			break;
+		case T_CypherListCompExpr:
+			{
+				CypherListCompExpr *clc = (CypherListCompExpr *) node;
+
+				if (walker(clc->list, context))
+					return true;
+				if (walker(clc->cond, context))
+					return true;
+				if (walker(clc->elem, context))
+					return true;
+			}
+			break;
+		case T_CypherListCompVar:
+			break;
+		case T_CypherAccessExpr:
+			{
+				CypherAccessExpr *a = (CypherAccessExpr *) node;
+				ListCell   *le;
+
+				if (walker(a->arg, context))
+					return true;
+
+				foreach(le, a->path)
+				{
+					Node	   *elem = lfirst(le);
+
+					if (IsA(elem, CypherIndices))
+					{
+						CypherIndices *cind = (CypherIndices *) elem;
+
+						if (walker(cind->lidx, context))
+							return true;
+						if (walker(cind->uidx, context))
+							return true;
+					}
+					else
+					{
+						if (walker(elem, context))
+							return true;
+					}
+				}
+			}
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
@@ -2278,11 +2436,23 @@ query_tree_walker(Query *query,
 		return true;
 	if (walker(query->dijkstraEdgeId, context))
 		return true;
-	if (walker(query->dijkstraSource, context))
-		return true;
-	if (walker(query->dijkstraTarget, context))
-		return true;
 	if (walker(query->dijkstraLimit, context))
+		return true;
+	if (walker(query->shortestpathEndIdLeft, context))
+		return true;
+	if (walker(query->shortestpathEndIdRight, context))
+		return true;
+	if (walker(query->shortestpathTableOidLeft, context))
+		return true;
+	if (walker(query->shortestpathTableOidRight, context))
+		return true;
+	if (walker(query->shortestpathCtidLeft, context))
+		return true;
+	if (walker(query->shortestpathCtidRight, context))
+		return true;
+	if (walker(query->shortestpathSource, context))
+		return true;
+	if (walker(query->shortestpathTarget, context))
 		return true;
 	if (!(flags & QTW_IGNORE_CTE_SUBQUERIES))
 	{
@@ -2326,6 +2496,7 @@ range_table_walker(List *rtable,
 					return true;
 				break;
 			case RTE_CTE:
+			case RTE_NAMEDTUPLESTORE:
 				/* nothing to do */
 				break;
 			case RTE_SUBQUERY:
@@ -2340,6 +2511,10 @@ range_table_walker(List *rtable,
 				break;
 			case RTE_FUNCTION:
 				if (walker(rte->functions, context))
+					return true;
+				break;
+			case RTE_TABLEFUNC:
+				if (walker(rte->tablefunc, context))
 					return true;
 				break;
 			case RTE_VALUES:
@@ -2472,10 +2647,12 @@ expression_tree_mutator(Node *node,
 			}
 			break;
 		case T_Param:
-		case T_CoerceToDomainValue:
 		case T_CaseTestExpr:
+		case T_SQLValueFunction:
+		case T_CoerceToDomainValue:
 		case T_SetToDefault:
 		case T_CurrentOfExpr:
+		case T_NextValueExpr:
 		case T_RangeTblRef:
 		case T_SortGroupClause:
 			return (Node *) copyObject(node);
@@ -3030,33 +3207,90 @@ expression_tree_mutator(Node *node,
 				return (Node *) newnode;
 			}
 			break;
-		case T_EdgeRefProp:
+		case T_TableFunc:
 			{
-				EdgeRefProp *erf = (EdgeRefProp *) node;
-				EdgeRefProp *newnode;
+				TableFunc  *tf = (TableFunc *) node;
+				TableFunc  *newnode;
 
-				FLATCOPY(newnode, erf, EdgeRefProp);
-				MUTATE(newnode->arg, erf->arg, Expr *);
+				FLATCOPY(newnode, tf, TableFunc);
+				MUTATE(newnode->ns_uris, tf->ns_uris, List *);
+				MUTATE(newnode->docexpr, tf->docexpr, Node *);
+				MUTATE(newnode->rowexpr, tf->rowexpr, Node *);
+				MUTATE(newnode->colexprs, tf->colexprs, List *);
+				MUTATE(newnode->coldefexprs, tf->coldefexprs, List *);
 				return (Node *) newnode;
 			}
 			break;
-		case T_EdgeRefRow:
+		case T_CypherTypeCast:
 			{
-				EdgeRefRow *err = (EdgeRefRow *) node;
-				EdgeRefRow *newnode;
+				CypherTypeCast *tc = (CypherTypeCast *) node;
+				CypherTypeCast *newnode;
 
-				FLATCOPY(newnode, err, EdgeRefRow);
-				MUTATE(newnode->arg, err->arg, Expr *);
+				FLATCOPY(newnode, tc, CypherTypeCast);
+				MUTATE(newnode->arg, tc->arg, Expr *);
 				return (Node *) newnode;
 			}
 			break;
-		case T_EdgeRefRows:
+		case T_CypherMapExpr:
 			{
-				EdgeRefRows *err = (EdgeRefRows *) node;
-				EdgeRefRows *newnode;
+				CypherMapExpr *m = (CypherMapExpr *) node;
+				CypherMapExpr *newnode;
 
-				FLATCOPY(newnode, err, EdgeRefRows);
-				MUTATE(newnode->arg, err->arg, Expr *);
+				FLATCOPY(newnode, m, CypherMapExpr);
+				MUTATE(newnode->keyvals, m->keyvals, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+				CypherListExpr *newnode;
+
+				FLATCOPY(newnode, cl, CypherListExpr);
+				MUTATE(newnode->elems, cl->elems, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListCompExpr:
+			{
+				CypherListCompExpr *clc = (CypherListCompExpr *) node;
+				CypherListCompExpr *newnode;
+
+				FLATCOPY(newnode, clc, CypherListCompExpr);
+				MUTATE(newnode->list, clc->list, Expr*);
+				MUTATE(newnode->cond, clc->cond, Expr*);
+				MUTATE(newnode->elem, clc->elem, Expr*);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListCompVar:
+			{
+				CypherListCompVar *clcv = (CypherListCompVar *) node;
+				CypherListCompVar *newnode;
+
+				FLATCOPY(newnode, clcv, CypherListCompVar);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherAccessExpr:
+			{
+				CypherAccessExpr *a = (CypherAccessExpr *) node;
+				CypherAccessExpr *newnode;
+
+				FLATCOPY(newnode, a, CypherAccessExpr);
+				MUTATE(newnode->arg, a->arg, Expr *);
+				MUTATE(newnode->path, a->path, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherIndices:
+			{
+				CypherIndices *i = (CypherIndices *) node;
+				CypherIndices *newnode;
+
+				FLATCOPY(newnode, i, CypherIndices);
+				MUTATE(newnode->lidx, i->lidx, Expr *);
+				MUTATE(newnode->uidx, i->uidx, Expr *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3116,12 +3350,18 @@ query_tree_mutator(Query *query,
 	MUTATE(query->limitCount, query->limitCount, Node *);
 	MUTATE(query->dijkstraEndId, query->dijkstraEndId, Node *);
 	MUTATE(query->dijkstraEdgeId, query->dijkstraEdgeId, Node *);
-	MUTATE(query->dijkstraSource, query->dijkstraSource, Node *);
-	MUTATE(query->dijkstraTarget, query->dijkstraTarget, Node *);
 	MUTATE(query->dijkstraLimit, query->dijkstraLimit, Node *);
+	MUTATE(query->shortestpathEndIdLeft, query->shortestpathEndIdLeft, Node *);
+	MUTATE(query->shortestpathEndIdRight, query->shortestpathEndIdRight, Node *);
+	MUTATE(query->shortestpathTableOidLeft, query->shortestpathTableOidLeft, Node *);
+	MUTATE(query->shortestpathTableOidRight, query->shortestpathTableOidRight, Node *);
+	MUTATE(query->shortestpathCtidLeft, query->shortestpathCtidLeft, Node *);
+	MUTATE(query->shortestpathCtidRight, query->shortestpathCtidRight, Node *);
+	MUTATE(query->shortestpathSource, query->shortestpathSource, Node *);
+	MUTATE(query->shortestpathTarget, query->shortestpathTarget, Node *);
 	if (!(flags & QTW_IGNORE_CTE_SUBQUERIES))
 		MUTATE(query->cteList, query->cteList, List *);
-	else	/* else copy CTE list as-is */
+	else						/* else copy CTE list as-is */
 		query->cteList = copyObject(query->cteList);
 	query->rtable = range_table_mutator(query->rtable,
 										mutator, context, flags);
@@ -3156,6 +3396,7 @@ range_table_mutator(List *rtable,
 				/* we don't bother to copy eref, aliases, etc; OK? */
 				break;
 			case RTE_CTE:
+			case RTE_NAMEDTUPLESTORE:
 				/* nothing to do */
 				break;
 			case RTE_SUBQUERY:
@@ -3181,6 +3422,9 @@ range_table_mutator(List *rtable,
 				break;
 			case RTE_FUNCTION:
 				MUTATE(newrte->functions, rte->functions, List *);
+				break;
+			case RTE_TABLEFUNC:
+				MUTATE(newrte->tablefunc, rte->tablefunc, TableFunc *);
 				break;
 			case RTE_VALUES:
 				MUTATE(newrte->values_lists, rte->values_lists, List *);
@@ -3275,6 +3519,7 @@ raw_expression_tree_walker(Node *node,
 	{
 		case T_SetToDefault:
 		case T_CurrentOfExpr:
+		case T_SQLValueFunction:
 		case T_Integer:
 		case T_Float:
 		case T_String:
@@ -3312,9 +3557,8 @@ raw_expression_tree_walker(Node *node,
 				/* we assume walker doesn't care about CaseWhens, either */
 				foreach(temp, caseexpr->args)
 				{
-					CaseWhen   *when = (CaseWhen *) lfirst(temp);
+					CaseWhen   *when = lfirst_node(CaseWhen, temp);
 
-					Assert(IsA(when, CaseWhen));
 					if (walker(when->expr, context))
 						return true;
 					if (walker(when->result, context))
@@ -3606,6 +3850,32 @@ raw_expression_tree_walker(Node *node,
 					return true;
 			}
 			break;
+		case T_RangeTableFunc:
+			{
+				RangeTableFunc *rtf = (RangeTableFunc *) node;
+
+				if (walker(rtf->docexpr, context))
+					return true;
+				if (walker(rtf->rowexpr, context))
+					return true;
+				if (walker(rtf->namespaces, context))
+					return true;
+				if (walker(rtf->columns, context))
+					return true;
+				if (walker(rtf->alias, context))
+					return true;
+			}
+			break;
+		case T_RangeTableFuncCol:
+			{
+				RangeTableFuncCol *rtfc = (RangeTableFuncCol *) node;
+
+				if (walker(rtfc->colexpr, context))
+					return true;
+				if (walker(rtfc->coldefexpr, context))
+					return true;
+			}
+			break;
 		case T_TypeName:
 			{
 				TypeName   *tn = (TypeName *) node;
@@ -3679,27 +3949,42 @@ raw_expression_tree_walker(Node *node,
 			break;
 		case T_CommonTableExpr:
 			return walker(((CommonTableExpr *) node)->ctequery, context);
-		case T_JsonObject:
+		case T_CypherListComp:
 			{
-				JsonObject *jsonobj = (JsonObject *) node;
+				CypherListComp *clc = (CypherListComp *) node;
 
-				foreach(temp, jsonobj->keyvals)
-				{
-					JsonKeyVal *keyval = lfirst(temp);
-
-					if (walker(keyval->key, context))
-						return true;
-					if (walker(keyval->val, context))
-						return true;
-				}
+				if (walker(clc->list, context))
+					return true;
+				if (walker(clc->cond, context))
+					return true;
+				if (walker(clc->elem, context))
+					return true;
 			}
 			break;
-		case T_EdgeRefProp:
-			return walker(((EdgeRefProp *) node)->arg, context);
-		case T_EdgeRefRow:
-			return walker(((EdgeRefRow *) node)->arg, context);
-		case T_EdgeRefRows:
-			return walker(((EdgeRefRows *) node)->arg, context);
+		case T_CypherGenericExpr:
+			{
+				CypherGenericExpr *g = (CypherGenericExpr *) node;
+
+				if (walker(g->expr, context))
+					return true;
+			}
+			break;
+		case T_CypherMapExpr:
+			{
+				CypherMapExpr *m = (CypherMapExpr *) node;
+
+				if (walker(m->keyvals, context))
+					return true;
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+
+				if (walker(cl->elems, context))
+					return true;
+			}
+			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -3745,31 +4030,31 @@ planstate_tree_walker(PlanState *planstate,
 	{
 		case T_ModifyTable:
 			if (planstate_walk_members(((ModifyTable *) plan)->plans,
-								  ((ModifyTableState *) planstate)->mt_plans,
+									   ((ModifyTableState *) planstate)->mt_plans,
 									   walker, context))
 				return true;
 			break;
 		case T_Append:
 			if (planstate_walk_members(((Append *) plan)->appendplans,
-									((AppendState *) planstate)->appendplans,
+									   ((AppendState *) planstate)->appendplans,
 									   walker, context))
 				return true;
 			break;
 		case T_MergeAppend:
 			if (planstate_walk_members(((MergeAppend *) plan)->mergeplans,
-								((MergeAppendState *) planstate)->mergeplans,
+									   ((MergeAppendState *) planstate)->mergeplans,
 									   walker, context))
 				return true;
 			break;
 		case T_BitmapAnd:
 			if (planstate_walk_members(((BitmapAnd *) plan)->bitmapplans,
-								 ((BitmapAndState *) planstate)->bitmapplans,
+									   ((BitmapAndState *) planstate)->bitmapplans,
 									   walker, context))
 				return true;
 			break;
 		case T_BitmapOr:
 			if (planstate_walk_members(((BitmapOr *) plan)->bitmapplans,
-								  ((BitmapOrState *) planstate)->bitmapplans,
+									   ((BitmapOrState *) planstate)->bitmapplans,
 									   walker, context))
 				return true;
 			break;
@@ -3807,9 +4092,8 @@ planstate_walk_subplans(List *plans,
 
 	foreach(lc, plans)
 	{
-		SubPlanState *sps = (SubPlanState *) lfirst(lc);
+		SubPlanState *sps = lfirst_node(SubPlanState, lc);
 
-		Assert(IsA(sps, SubPlanState));
 		if (walker(sps->planstate, context))
 			return true;
 	}
@@ -4411,33 +4695,45 @@ raw_expression_tree_mutator(Node *node,
 				return (Node *) newnode;
 			}
 			break;
-		case T_EdgeRefProp:
+		case T_CypherListComp:
 			{
-				EdgeRefProp *erf = (EdgeRefProp *) node;
-				EdgeRefProp *newnode;
+				CypherListComp *clc = (CypherListComp *) node;
+				CypherListComp *newnode;
 
-				FLATCOPY(newnode, erf, EdgeRefProp);
-				MUTATE(newnode->arg, erf->arg, Expr *);
+				FLATCOPY(newnode, clc, CypherListComp);
+				MUTATE(newnode->list, clc->list, Node *);
+				MUTATE(newnode->cond, clc->cond, Node *);
+				MUTATE(newnode->elem, clc->elem, Node *);
 				return (Node *) newnode;
 			}
 			break;
-		case T_EdgeRefRow:
+		case T_CypherGenericExpr:
 			{
-				EdgeRefRow *err = (EdgeRefRow *) node;
-				EdgeRefRow *newnode;
+				CypherGenericExpr *g = (CypherGenericExpr *) node;
+				CypherGenericExpr *newnode;
 
-				FLATCOPY(newnode, err, EdgeRefRow);
-				MUTATE(newnode->arg, err->arg, Expr *);
+				FLATCOPY(newnode, g, CypherGenericExpr);
+				MUTATE(newnode->expr, g->expr, Node *);
 				return (Node *) newnode;
 			}
 			break;
-		case T_EdgeRefRows:
+		case T_CypherMapExpr:
 			{
-				EdgeRefRows *err = (EdgeRefRows *) node;
-				EdgeRefRows *newnode;
+				CypherMapExpr *m = (CypherMapExpr *) node;
+				CypherMapExpr *newnode;
 
-				FLATCOPY(newnode, err, EdgeRefRows);
-				MUTATE(newnode->arg, err->arg, Expr *);
+				FLATCOPY(newnode, m, CypherMapExpr);
+				MUTATE(newnode->keyvals, m->keyvals, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+				CypherListExpr *newnode;
+
+				FLATCOPY(newnode, cl, CypherListExpr);
+				MUTATE(newnode->elems, cl->elems, List *);
 				return (Node *) newnode;
 			}
 			break;

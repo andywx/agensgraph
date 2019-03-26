@@ -15,8 +15,10 @@
 #include "access/htup_details.h"
 #include "access/tupdesc.h"
 #include "catalog/ag_graph_fn.h"
+#include "catalog/ag_label.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_inherits_fn.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "libpq/libpq.h"
@@ -28,6 +30,9 @@
 #include "utils/int8.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/regproc.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 
 #define GRAPHID_FMTSTR			"%hu." UINT64_FORMAT
@@ -48,27 +53,48 @@ typedef enum EdgeVertexKind {
 	EVK_END
 } EdgeVertexKind;
 
+typedef struct LabelsOutData {
+	MemoryContext mctx;
+	uint16		label_labid;
+	Jsonb	   *labels;
+} LabelsOutData;
+
 static void graphid_out_si(StringInfo si, Datum graphid);
 static int graphid_cmp(FunctionCallInfo fcinfo);
+static Jsonb *int_to_jsonb(int i);
 static LabelOutData *cache_label(FmgrInfo *flinfo, uint16 labid);
 static void elems_out_si(StringInfo si, AnyArrayType *elems, FmgrInfo *flinfo);
+static void appendStringInfoDatumOut(StringInfo si, Datum d, bool isnull,
+									 FmgrInfo *out);
 static void get_elem_type_output(ArrayMetaState *state, Oid elem_type,
 								 MemoryContext mctx);
-static Datum array_iter_next_(array_iter *it, int idx, ArrayMetaState *state);
+static Datum array_iter_next_(array_iter *it, bool *isnull, int idx,
+							  ArrayMetaState *state);
 static void deform_tuple(HeapTupleHeader tuphdr, Datum *values, bool *isnull);
 static Datum tuple_getattr(HeapTupleHeader tuphdr, int attnum);
 static Datum getEdgeVertex(HeapTupleHeader edge, EdgeVertexKind evk);
+static LabelsOutData *cache_labels(FmgrInfo *flinfo, uint16 labid);
 static Datum makeArrayTypeDatum(Datum *elems, int nelem, Oid type);
 static Datum graphid_minval(void);
 
 Datum
 graphid(PG_FUNCTION_ARGS)
 {
-	uint16		labid = PG_GETARG_UINT16(0);
-	uint64		locid = DatumGetUInt64(PG_GETARG_DATUM(1));
+	int32		labid_i4 = PG_GETARG_INT32(0);
+	int64		locid_i8 = PG_GETARG_INT64(1);
 	Graphid		id;
 
-	GraphidSet(&id, labid, locid);
+	if (labid_i4 < 0 || labid_i4 > (int32) GRAPHID_LABID_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("labid out of range: %d", labid_i4)));
+
+	if (locid_i8 < 0 || locid_i8 > (int64) GRAPHID_LOCID_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("locid out of range: " INT64_FORMAT, locid_i8)));
+
+	GraphidSet(&id, (uint16) labid_i4, (uint64) locid_i8);
 
 	PG_RETURN_GRAPHID(id);
 }
@@ -80,27 +106,33 @@ graphid_in(PG_FUNCTION_ARGS)
 	char	   *str = PG_GETARG_CSTRING(0);
 	char	   *next;
 	char	   *endptr;
+	unsigned long labid_ul;
 	uint16		labid;
 	uint64		locid;
 	Graphid		id;
 
 	errno = 0;
-	labid = strtoul(str, &endptr, 10);
+	labid_ul = strtoul(str, &endptr, 10);
 	if (errno != 0 || endptr == str || *endptr != GRAPHID_DELIM)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type graphid: \"%s\"", str)));
+	if (labid_ul > GRAPHID_LABID_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("labid out of range")));
+	labid = (uint16) labid_ul;
 
 	next = endptr + 1;
-#ifdef HAVE_STRTOLL
-	locid = strtoll(next, &endptr, 10);
-	if (endptr == next || *endptr != '\0')
+	locid = pg_strtouint64(next, &endptr, 10);
+	if (errno != 0 || endptr == next || *endptr != '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type graphid: \"%s\"", str)));
-#else
-	locid = DatumGetUInt64(DirectFunctionCall1(int8in, CStringGetDatum(next)));
-#endif
+	if (locid > GRAPHID_LOCID_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("locid out of range")));
 
 	GraphidSet(&id, labid, locid);
 
@@ -184,8 +216,8 @@ graph_labid(PG_FUNCTION_ARGS)
 static int
 graphid_cmp(FunctionCallInfo fcinfo)
 {
-	Graphid	   id1 = PG_GETARG_GRAPHID(0);
-	Graphid	   id2 = PG_GETARG_GRAPHID(1);
+	Graphid		id1 = PG_GETARG_GRAPHID(0);
+	Graphid		id2 = PG_GETARG_GRAPHID(1);
 
 	if (id1 < id2)
 		return -1;
@@ -232,121 +264,11 @@ graphid_ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(graphid_cmp(fcinfo) >= 0);
 }
 
-/* edgeref APIs */
+/* rowid APIs */
 
 #define DatumGetItemPointer(X)		((ItemPointer) DatumGetPointer(X))
+#define ItemPointerGetDatum(X)		PointerGetDatum(X)
 #define PG_GETARG_ITEMPOINTER(n)	DatumGetItemPointer(PG_GETARG_DATUM(n))
-
-Datum
-edgeref(PG_FUNCTION_ARGS)
-{
-	int			relid = PG_GETARG_INT32(0);
-	ItemPointer	tid = PG_GETARG_ITEMPOINTER(1);
-	EdgeRef	   	edgeref;
-
-	EdgeRefSet(edgeref, relid, tid);
-
-	PG_RETURN_EDGEREF(edgeref);
-}
-
-Datum
-edgeref_in(PG_FUNCTION_ARGS)
-{
-	const char	DELIM = ',';
-	char	   *str = PG_GETARG_CSTRING(0);
-	char	   *ptr;
-	char	   *rdimpos;
-	char	   *endptr;
-	char	   *ctidbuf;
-	int			ctidbuflen;
-	Oid			typiofunc;
-	Oid			typioparam;
-	FmgrInfo	proc;
-	uint16		relid;
-	Datum		tid;
-	EdgeRef	   	edgeref;
-
-	ptr = str;
-
-	/* Allow leading whitespace */
-	while (*ptr && isspace((unsigned char) *ptr))
-		ptr++;
-	if (*ptr++ != '(')
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("malformed edgeref literal: \"%s\"", str),
-				 errdetail("Missing left parenthesis.")));
-
-	errno = 0;
-	ptr++;
-	relid = strtoul(ptr, &endptr, 10);
-	if (errno || *endptr != DELIM)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("malformed edgeref literal: \"%s\"", str),
-				 errdetail("Invalid relation index")));
-
-	ptr = endptr + 1;
-	rdimpos = strrchr(ptr, ')');
-	if (rdimpos == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("malformed edgeref literal: \"%s\"", str),
-				 errdetail("Invalid tid")));
-
-	ctidbuflen = rdimpos - ptr;
-	ctidbuf = palloc(sizeof(char) * ctidbuflen + 1);
-	strncpy(ctidbuf, ptr, ctidbuflen);
-	ctidbuf[ctidbuflen] = '\0';
-
-	getTypeInputInfo(TIDOID, &typiofunc, &typioparam);
-	fmgr_info_cxt(typiofunc, &proc, fcinfo->flinfo->fn_mcxt);
-
-	tid = InputFunctionCall(&proc, ctidbuf, typioparam, -1);
-
-	EdgeRefSet(edgeref, relid, (ItemPointer) DatumGetPointer(tid));
-
-	ptr = rdimpos + 1;
-
-	/* Allow trailing whitespace */
-	while (*ptr && isspace((unsigned char) *ptr))
-		ptr++;
-	if (*ptr)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("malformed record literal: \"%s\"", str),
-				 errdetail("Junk after right parenthesis.")));
-
-	pfree(ctidbuf);
-
-	PG_RETURN_EDGEREF(edgeref);
-}
-
-Datum
-edgeref_out(PG_FUNCTION_ARGS)
-{
-	EdgeRef	    eref = PG_GETARG_EDGEREF(0);
-	StringInfoData buf;
-	Oid			typiofunc;
-	bool		typisvarlena;
-	ItemPointerData tid;
-	FmgrInfo	proc;
-	char	   *value;
-
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "(%u,", EdgeRefGetRelid(eref));
-
-	getTypeOutputInfo(TIDOID, &typiofunc, &typisvarlena);
-	fmgr_info_cxt(typiofunc, &proc, fcinfo->flinfo->fn_mcxt);
-	ItemPointerSet(&tid, EdgeRefGetBlockNumber(eref), EdgeRefGetOffsetNumber(eref));
-	value = OutputFunctionCall(&proc, PointerGetDatum(&tid));
-
-	appendStringInfo(&buf, "%s)", value);
-
-	PG_RETURN_CSTRING(buf.data);
-}
-
-/* rowid APIs */
 
 Datum
 rowid(PG_FUNCTION_ARGS)
@@ -401,8 +323,6 @@ rowid_ctid(PG_FUNCTION_ARGS)
 
 	return PointerGetDatum(result);
 }
-
-#define ItemPointerGetDatum(X)	PointerGetDatum(X)
 
 Datum
 rowid_eq(PG_FUNCTION_ARGS)
@@ -537,14 +457,47 @@ _vertex_out(PG_FUNCTION_ARGS)
 Datum
 vertex_label(PG_FUNCTION_ARGS)
 {
-	Graphid id;
+	Graphid		id;
 	LabelOutData *my_extra;
+	char	   *label;
+	JsonbValue	jv;
 
 	id = DatumGetGraphid(getVertexIdDatum(PG_GETARG_DATUM(0)));
 
 	my_extra = cache_label(fcinfo->flinfo, GraphidGetLabid(id));
 
-	PG_RETURN_TEXT_P(cstring_to_text(NameStr(my_extra->label)));
+	label = NameStr(my_extra->label);
+
+	jv.type = jbvString;
+	jv.val.string.len = strlen(label);
+	jv.val.string.val = label;
+
+	PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
+}
+
+Datum
+_vertex_length(PG_FUNCTION_ARGS)
+{
+	AnyArrayType *vertices = PG_GETARG_ANY_ARRAY(0);
+	int			nvertices;
+
+	nvertices = ArrayGetNItems(AARR_NDIM(vertices), AARR_DIMS(vertices));
+
+	PG_RETURN_JSONB(int_to_jsonb(nvertices));
+}
+
+static Jsonb *
+int_to_jsonb(int i)
+{
+	Datum		n;
+	JsonbValue	jv;
+
+	n = DirectFunctionCall1(int4_numeric, Int32GetDatum(i));
+
+	jv.type = jbvNumeric;
+	jv.val.numeric = DatumGetNumeric(n);
+
+	return JsonbValueToJsonb(&jv);
 }
 
 Datum
@@ -672,14 +625,33 @@ _edge_out(PG_FUNCTION_ARGS)
 Datum
 edge_label(PG_FUNCTION_ARGS)
 {
-	Graphid id;
+	Graphid		id;
 	LabelOutData *my_extra;
+	char	   *label;
+	JsonbValue	jv;
 
 	id = DatumGetGraphid(getEdgeIdDatum(PG_GETARG_DATUM(0)));
 
 	my_extra = cache_label(fcinfo->flinfo, GraphidGetLabid(id));
 
-	PG_RETURN_TEXT_P(cstring_to_text(NameStr(my_extra->label)));
+	label = NameStr(my_extra->label);
+
+	jv.type = jbvString;
+	jv.val.string.len = strlen(label);
+	jv.val.string.val = label;
+
+	PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
+}
+
+Datum
+_edge_length(PG_FUNCTION_ARGS)
+{
+	AnyArrayType *edges = PG_GETARG_ANY_ARRAY(0);
+	int			nedges;
+
+	nedges = ArrayGetNItems(AARR_NDIM(edges), AARR_DIMS(edges));
+
+	PG_RETURN_JSONB(int_to_jsonb(nedges));
 }
 
 Datum
@@ -770,7 +742,7 @@ cache_label(FmgrInfo *flinfo, uint16 labid)
 
 		label = get_labid_labname(graphoid, labid);
 		if (label == NULL)
-			label = "?";
+			elog(ERROR, "cache lookup failed for label %hu", labid);
 
 		my_extra->label_labid = labid;
 		strncpy(NameStr(my_extra->label), label, sizeof(my_extra->label));
@@ -788,7 +760,6 @@ elems_out_si(StringInfo si, AnyArrayType *elems, FmgrInfo *flinfo)
 	ArrayMetaState *my_extra;
 	int			nelems;
 	array_iter	it;
-	Datum		value;
 	int			i;
 
 	my_extra = (ArrayMetaState *) flinfo->fn_extra;
@@ -801,22 +772,35 @@ elems_out_si(StringInfo si, AnyArrayType *elems, FmgrInfo *flinfo)
 	}
 
 	nelems = ArrayGetNItems(AARR_NDIM(elems), AARR_DIMS(elems));
+	if (nelems < 1)
+	{
+		appendBinaryStringInfo(si, "[]", 2);
+		return;
+	}
 
 	appendStringInfoChar(si, '[');
 	array_iter_setup(&it, elems);
-	if (nelems > 0)
+	for (i = 0; i < nelems; i++)
 	{
-		value = array_iter_next_(&it, 0, my_extra);
-		appendStringInfoString(si, OutputFunctionCall(&my_extra->proc, value));
-	}
-	for (i = 1; i < nelems; i++)
-	{
-		appendStringInfoChar(si, delim);
+		bool		isnull;
+		Datum		value;
 
-		value = array_iter_next_(&it, i, my_extra);
-		appendStringInfoString(si, OutputFunctionCall(&my_extra->proc, value));
+		if (i > 0)
+			appendStringInfoChar(si, delim);
+
+		value = array_iter_next_(&it, &isnull, i, my_extra);
+		appendStringInfoDatumOut(si, value, isnull, &my_extra->proc);
 	}
 	appendStringInfoChar(si, ']');
+}
+
+static void
+appendStringInfoDatumOut(StringInfo si, Datum d, bool isnull, FmgrInfo *out)
+{
+	if (isnull)
+		appendBinaryStringInfo(si, "NULL", 4);
+	else
+		appendStringInfoString(si, OutputFunctionCall(out, d));
 }
 
 Datum
@@ -827,12 +811,13 @@ graphpath_out(PG_FUNCTION_ARGS)
 	Datum		edges_datum;
 	AnyArrayType *vertices;
 	AnyArrayType *edges;
-	GraphpathOutData *my_extra;
 	int			nvertices;
 	int			nedges;
+	GraphpathOutData *my_extra;
 	StringInfoData si;
 	array_iter	it_v;
 	array_iter	it_e;
+	bool		isnull;
 	Datum		value;
 	int			i;
 
@@ -840,6 +825,16 @@ graphpath_out(PG_FUNCTION_ARGS)
 
 	vertices = DatumGetAnyArray(vertices_datum);
 	edges = DatumGetAnyArray(edges_datum);
+
+	nvertices = ArrayGetNItems(AARR_NDIM(vertices), AARR_DIMS(vertices));
+	nedges = ArrayGetNItems(AARR_NDIM(edges), AARR_DIMS(edges));
+	if (nvertices < 1)
+		PG_RETURN_CSTRING("[]");
+
+	if (nvertices != nedges + 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("the numbers of vertices and edges are mismatched")));
 
 	/* cache vertex/edge output information */
 	my_extra = (GraphpathOutData *) fcinfo->flinfo->fn_extra;
@@ -854,37 +849,27 @@ graphpath_out(PG_FUNCTION_ARGS)
 							 fcinfo->flinfo->fn_mcxt);
 	}
 
-	nvertices = ArrayGetNItems(AARR_NDIM(vertices), AARR_DIMS(vertices));
-	nedges = ArrayGetNItems(AARR_NDIM(edges), AARR_DIMS(edges));
-	if (nvertices != nedges + 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("the numbers of vertices and edges are mismatched")));
-
 	initStringInfo(&si);
 	appendStringInfoChar(&si, '[');
 
 	array_iter_setup(&it_v, vertices);
 	array_iter_setup(&it_e, edges);
 
-	value = array_iter_next_(&it_v, 0, &my_extra->vertex);
-	appendStringInfoString(&si,
-			OutputFunctionCall(&my_extra->vertex.proc, value));
-
 	for (i = 0; i < nedges; i++)
 	{
-		appendStringInfoChar(&si, delim);
-
-		value = array_iter_next_(&it_e, i, &my_extra->edge);
-		appendStringInfoString(&si,
-				OutputFunctionCall(&my_extra->edge.proc, value));
+		value = array_iter_next_(&it_v, &isnull, i, &my_extra->vertex);
+		appendStringInfoDatumOut(&si, value, isnull, &my_extra->vertex.proc);
 
 		appendStringInfoChar(&si, delim);
 
-		value = array_iter_next_(&it_v, i + 1, &my_extra->vertex);
-		appendStringInfoString(&si,
-				OutputFunctionCall(&my_extra->vertex.proc, value));
+		value = array_iter_next_(&it_e, &isnull, i, &my_extra->edge);
+		appendStringInfoDatumOut(&si, value, isnull, &my_extra->edge.proc);
+
+		appendStringInfoChar(&si, delim);
 	}
+
+	value = array_iter_next_(&it_v, &isnull, i, &my_extra->vertex);
+	appendStringInfoDatumOut(&si, value, isnull, &my_extra->vertex.proc);
 
 	appendStringInfoChar(&si, ']');
 
@@ -901,16 +886,21 @@ get_elem_type_output(ArrayMetaState *state, Oid elem_type, MemoryContext mctx)
 }
 
 static Datum
-array_iter_next_(array_iter *it, int idx, ArrayMetaState *state)
+array_iter_next_(array_iter *it, bool *isnull, int idx, ArrayMetaState *state)
 {
-	bool		isnull;
-	Datum		value;
+	return array_iter_next(it, isnull, idx,
+						   state->typlen, state->typbyval, state->typalign);
+}
 
-	value = array_iter_next(it, &isnull, idx,
-							state->typlen, state->typbyval, state->typalign);
-	Assert(!isnull);
+Datum
+_graphpath_length(PG_FUNCTION_ARGS)
+{
+	AnyArrayType *graphpaths = PG_GETARG_ANY_ARRAY(0);
+	int			ngraphpaths;
 
-	return value;
+	ngraphpaths = ArrayGetNItems(AARR_NDIM(graphpaths), AARR_DIMS(graphpaths));
+
+	PG_RETURN_JSONB(int_to_jsonb(ngraphpaths));
 }
 
 Datum
@@ -924,7 +914,7 @@ graphpath_length(PG_FUNCTION_ARGS)
 	edges = DatumGetAnyArray(edges_datum);
 	nedges = ArrayGetNItems(AARR_NDIM(edges), AARR_DIMS(edges));
 
-	PG_RETURN_INT32(nedges);
+	PG_RETURN_JSONB(int_to_jsonb(nedges));
 }
 
 Datum
@@ -1010,13 +1000,12 @@ static Datum
 getEdgeVertex(HeapTupleHeader edge, EdgeVertexKind evk)
 {
 	const char *querystr =
-			"SELECT (" AG_ELEM_LOCAL_ID ", " AG_ELEM_PROP_MAP ")::vertex "
+			"SELECT (" AG_ELEM_LOCAL_ID ", " AG_ELEM_PROP_MAP ", NULL)::vertex "
 			"FROM \"%s\"." AG_VERTEX " WHERE " AG_ELEM_LOCAL_ID " = $1";
 	char		sqlcmd[256];
 	int			attnum = (evk == EVK_START ? Anum_edge_start : Anum_edge_end);
 	Datum		values[1];
 	Oid			argTypes[1] = {GRAPHIDOID};
-	bool		spi_pushed;
 	int			ret;
 	Datum		vertex;
 	bool		isnull;
@@ -1025,12 +1014,10 @@ getEdgeVertex(HeapTupleHeader edge, EdgeVertexKind evk)
 
 	values[0] = tuple_getattr(edge, attnum);
 
-	spi_pushed = SPI_push_conditional();
-
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 
-	ret = SPI_execute_with_args(sqlcmd, 2, argTypes, values, NULL, false, 0);
+	ret = SPI_execute_with_args(sqlcmd, 2, argTypes, values, NULL, true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute failed: %s", sqlcmd);
 
@@ -1048,8 +1035,6 @@ getEdgeVertex(HeapTupleHeader edge, EdgeVertexKind evk)
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
 
-	SPI_pop_conditional(spi_pushed);
-
 	return vertex;
 }
 
@@ -1057,16 +1042,103 @@ Datum
 vertex_labels(PG_FUNCTION_ARGS)
 {
 	Graphid		id;
-	LabelOutData *my_extra;
-	Datum		label;
+	LabelsOutData *my_extra;
 
 	id = DatumGetGraphid(getVertexIdDatum(PG_GETARG_DATUM(0)));
 
-	my_extra = cache_label(fcinfo->flinfo, GraphidGetLabid(id));
+	my_extra = cache_labels(fcinfo->flinfo, GraphidGetLabid(id));
 
-	label = CStringGetTextDatum(NameStr(my_extra->label));
+	PG_RETURN_JSONB(my_extra->labels);
+}
 
-	PG_RETURN_ARRAYTYPE_P(makeArrayTypeDatum(&label, 1, TEXTOID));
+static LabelsOutData *
+cache_labels(FmgrInfo *flinfo, uint16 labid)
+{
+	MemoryContext oldMemoryContext;
+	LabelsOutData *my_extra;
+
+	AssertArg(flinfo != NULL);
+
+	oldMemoryContext = MemoryContextSwitchTo(flinfo->fn_mcxt);
+
+	my_extra = (LabelsOutData *) flinfo->fn_extra;
+	if (my_extra == NULL)
+	{
+		flinfo->fn_extra = palloc(sizeof(*my_extra));
+		my_extra = (LabelsOutData *) flinfo->fn_extra;
+		my_extra->mctx = AllocSetContextCreate(CurrentMemoryContext,
+											   "vertex_labels() cache",
+											   ALLOCSET_DEFAULT_SIZES);
+		my_extra->label_labid = 0;
+		my_extra->labels = NULL;
+	}
+
+	if (my_extra->label_labid != labid)
+	{
+		MemoryContext funcMemoryContext;
+		Oid			graphoid;
+		Oid			label_relid;
+		List	   *ancestor_relids;
+		JsonbParseState *jpstate = NULL;
+		ListCell   *li;
+		JsonbValue *labels;
+
+		if (my_extra->labels != NULL)
+			pfree(my_extra->labels);
+		MemoryContextReset(my_extra->mctx);
+
+		funcMemoryContext = MemoryContextSwitchTo(my_extra->mctx);
+
+		graphoid = get_graph_path_oid();
+
+		/* get relation IDs of ancestor labels */
+		label_relid = get_labid_relid(graphoid, labid);
+		ancestor_relids = find_all_ancestors(label_relid, AccessShareLock);
+
+		pushJsonbValue(&jpstate, WJB_BEGIN_ARRAY, NULL);
+
+		foreach(li, ancestor_relids)
+		{
+			Oid			ancestor_relid = lfirst_oid(li);
+			HeapTuple	tp;
+			char	   *ancestor_labname;
+
+			tp = SearchSysCache1(LABELRELID, ObjectIdGetDatum(ancestor_relid));
+			if (HeapTupleIsValid(tp))
+			{
+				Form_ag_label labtup = (Form_ag_label) GETSTRUCT(tp);
+
+				ancestor_labname = pstrdup(NameStr(labtup->labname));
+
+				ReleaseSysCache(tp);
+			}
+			else
+			{
+				elog(ERROR, "cache lookup failed for label %u", ancestor_relid);
+			}
+
+			if (strcmp(ancestor_labname, "ag_vertex") != 0)
+			{
+				JsonbValue	jv;
+
+				jv.type = jbvString;
+				jv.val.string.len = strlen(ancestor_labname);
+				jv.val.string.val = ancestor_labname;
+
+				pushJsonbValue(&jpstate, WJB_ELEM, &jv);
+			}
+		}
+
+		labels = pushJsonbValue(&jpstate, WJB_END_ARRAY, NULL);
+
+		MemoryContextSwitchTo(funcMemoryContext);
+
+		my_extra->labels = JsonbValueToJsonb(labels);
+	}
+
+	MemoryContextSwitchTo(oldMemoryContext);
+
+	return my_extra;
 }
 
 Datum
@@ -1077,13 +1149,20 @@ getVertexIdDatum(Datum datum)
 	return tuple_getattr(tuphdr, Anum_vertex_id);
 }
 
-
 Datum
 getVertexPropDatum(Datum datum)
 {
 	HeapTupleHeader	tuphdr = DatumGetHeapTupleHeader(datum);
 
 	return tuple_getattr(tuphdr, Anum_vertex_properties);
+}
+
+Datum
+getVertexTidDatum(Datum datum)
+{
+	HeapTupleHeader	tuphdr = DatumGetHeapTupleHeader(datum);
+
+	return tuple_getattr(tuphdr, Anum_vertex_tid);
 }
 
 Datum
@@ -1116,6 +1195,14 @@ getEdgePropDatum(Datum datum)
 	HeapTupleHeader	tuphdr = DatumGetHeapTupleHeader(datum);
 
 	return tuple_getattr(tuphdr, Anum_edge_properties);
+}
+
+Datum
+getEdgeTidDatum(Datum datum)
+{
+	HeapTupleHeader	tuphdr = DatumGetHeapTupleHeader(datum);
+
+	return tuple_getattr(tuphdr, Anum_edge_tid);
 }
 
 void
@@ -1176,15 +1263,16 @@ makeGraphpathDatum(Datum *vertices, int nvertices, Datum *edges, int nedges)
 }
 
 Datum
-makeGraphVertexDatum(Datum id, Datum prop_map)
+makeGraphVertexDatum(Datum id, Datum prop_map, Datum tid)
 {
 	Datum		values[Natts_vertex];
-	bool		isnull[Natts_vertex] = {false, false};
+	bool		isnull[Natts_vertex] = {false, false, false};
 	TupleDesc	tupDesc;
 	HeapTuple	vertex;
 
 	values[Anum_vertex_id - 1] = id;
 	values[Anum_vertex_properties - 1] = prop_map;
+	values[Anum_vertex_tid - 1] = tid;
 
 	tupDesc = lookup_rowtype_tupdesc(VERTEXOID, -1);
 	Assert(tupDesc->natts == Natts_vertex);
@@ -1197,10 +1285,10 @@ makeGraphVertexDatum(Datum id, Datum prop_map)
 }
 
 Datum
-makeGraphEdgeDatum(Datum id, Datum start, Datum end, Datum prop_map)
+makeGraphEdgeDatum(Datum id, Datum start, Datum end, Datum prop_map, Datum tid)
 {
 	Datum		values[Natts_edge];
-	bool		isnull[Natts_edge] = {false, false, false, false};
+	bool		isnull[Natts_edge] = {false, false, false, false, false};
 	TupleDesc	tupDesc;
 	HeapTuple	edge;
 
@@ -1208,6 +1296,7 @@ makeGraphEdgeDatum(Datum id, Datum start, Datum end, Datum prop_map)
 	values[Anum_edge_start - 1] = start;
 	values[Anum_edge_end - 1] = end;
 	values[Anum_edge_properties - 1] = prop_map;
+	values[Anum_edge_tid - 1] = tid;
 
 	tupDesc = lookup_rowtype_tupdesc(EDGEOID, -1);
 	Assert(tupDesc->natts == Natts_edge);
@@ -1258,6 +1347,15 @@ graphid_hash(PG_FUNCTION_ARGS)
 	StaticAssertStmt(sizeof(id) == 8, "the size of graphid must be 8");
 
 	return hash_any((unsigned char *) &id, sizeof(id));
+}
+
+/* HASHPROC (1) */
+Datum
+vertex_hash(PG_FUNCTION_ARGS)
+{
+	Datum id = getVertexIdDatum(PG_GETARG_DATUM(0));
+
+	PG_RETURN_DATUM(DirectFunctionCall1(graphid_hash, id));
 }
 
 /*

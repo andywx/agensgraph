@@ -1,14 +1,13 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2017, PostgreSQL Global Development Group
  *
  * src/bin/psql/help.c
  */
 #include "postgres_fe.h"
 
 #ifndef WIN32
-#include <sys/types.h>			/* (ditto) */
 #include <unistd.h>				/* for geteuid() */
 #else
 #include <win32.h>
@@ -28,6 +27,7 @@
 #include "input.h"
 #include "settings.h"
 #include "sql_help.h"
+#include "cypher_help.h"
 
 
 /*
@@ -69,7 +69,7 @@ usage(unsigned short int pager)
 	 * Keep this line count in sync with the number of lines printed below!
 	 * Use "psql --help=options | wc" to count correctly.
 	 */
-	output = PageOutput(61, pager ? &(pset.popt.topt) : NULL);
+	output = PageOutput(60, pager ? &(pset.popt.topt) : NULL);
 
 	fprintf(output, _("agens is the AgensGraph interactive terminal.\n\n"));
 	fprintf(output, _("Usage:\n"));
@@ -85,9 +85,10 @@ usage(unsigned short int pager)
 	fprintf(output, _("  -f, --file=FILENAME      execute commands from file, then exit\n"));
 	fprintf(output, _("  -l, --list               list available databases, then exit\n"));
 	fprintf(output, _("  -v, --set=, --variable=NAME=VALUE\n"
-			   "                           set agens variable NAME to VALUE\n"
-				 "                           (e.g., -v ON_ERROR_STOP=1)\n"));
+					  "                           set agens variable NAME to VALUE\n"
+					  "                           (e.g., -v ON_ERROR_STOP=1)\n"));
 	fprintf(output, _("  -V, --version            output version information, then exit\n"));
+	fprintf(output, _("      --revision           output revision information, then exit\n"));
 	fprintf(output, _("  -X, --no-agensrc         do not read startup file (~/.agensrc)\n"));
 	fprintf(output, _("  -1 (\"one\"), --single-transaction\n"
 					  "                           execute as a single transaction (if non-interactive)\n"));
@@ -167,16 +168,17 @@ slashUsage(unsigned short int pager)
 	 * Use "psql --help=commands | wc" to count correctly.  It's okay to count
 	 * the USE_READLINE line even in builds without that.
 	 */
-	output = PageOutput(117, pager ? &(pset.popt.topt) : NULL);
+	output = PageOutput(118, pager ? &(pset.popt.topt) : NULL);
 
 	fprintf(output, _("General\n"));
 	fprintf(output, _("  \\copyright             show PostgreSQL usage and distribution terms\n"));
+	fprintf(output, _("  \\crosstabview [COLUMNS] execute query and display results in crosstab\n"));
 	fprintf(output, _("  \\errverbose            show most recent error message at maximum verbosity\n"));
 	fprintf(output, _("  \\g [FILE] or ;         execute query (and send results to file or |pipe)\n"));
 	fprintf(output, _("  \\gexec                 execute query, then execute each value in its result\n"));
 	fprintf(output, _("  \\gset [PREFIX]         execute query and store results in psql variables\n"));
+	fprintf(output, _("  \\gx [FILE]             as \\g, but forces expanded output mode\n"));
 	fprintf(output, _("  \\q                     quit psql\n"));
-	fprintf(output, _("  \\crosstabview [COLUMNS] execute query and display results in crosstab\n"));
 	fprintf(output, _("  \\watch [SEC]           execute query every SEC seconds\n"));
 	fprintf(output, "\n");
 
@@ -209,6 +211,13 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\qecho [STRING]        write string to query output stream (see \\o)\n"));
 	fprintf(output, "\n");
 
+	fprintf(output, _("Conditional\n"));
+	fprintf(output, _("  \\if EXPR               begin conditional block\n"));
+	fprintf(output, _("  \\elif EXPR             alternative within current conditional block\n"));
+	fprintf(output, _("  \\else                  final alternative within current conditional block\n"));
+	fprintf(output, _("  \\endif                 end conditional block\n"));
+	fprintf(output, "\n");
+
 	fprintf(output, _("Informational\n"));
 	fprintf(output, _("  (options: S = show system objects, + = additional detail)\n"));
 	fprintf(output, _("  \\d[S+]                 list tables, views, and sequences\n"));
@@ -219,8 +228,9 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\dc[S+] [PATTERN]      list conversions\n"));
 	fprintf(output, _("  \\dC[+]  [PATTERN]      list casts\n"));
 	fprintf(output, _("  \\dd[S]  [PATTERN]      show object descriptions not displayed elsewhere\n"));
-	fprintf(output, _("  \\ddp    [PATTERN]      list default privileges\n"));
 	fprintf(output, _("  \\dD[S+] [PATTERN]      list domains\n"));
+	fprintf(output, _("  \\ddp    [PATTERN]      list default privileges\n"));
+	fprintf(output, _("  \\dE[S+] [PATTERN]      list foreign tables\n"));
 	fprintf(output, _("  \\det[+] [PATTERN]      list foreign tables\n"));
 	fprintf(output, _("  \\des[+] [PATTERN]      list foreign servers\n"));
 	fprintf(output, _("  \\deu[+] [PATTERN]      list user mappings\n"));
@@ -235,6 +245,7 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\dGe[+]  [PATTERN]     list graph edge labels\n"));
 	fprintf(output, _("  \\dGl[+]  [PATTERN]     list graph labels\n"));
 	fprintf(output, _("  \\dGv[+]  [PATTERN]     list graph vertex labels\n"));
+	fprintf(output, _("  \\dGi[+]  [PATTERN]     list graph property indexes\n"));
 	fprintf(output, _("  \\di[S+] [PATTERN]      list indexes\n"));
 	fprintf(output, _("  \\dl                    list large objects, same as \\lo_list\n"));
 	fprintf(output, _("  \\dL[S+] [PATTERN]      list procedural languages\n"));
@@ -244,12 +255,13 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\dO[S+] [PATTERN]      list collations\n"));
 	fprintf(output, _("  \\dp     [PATTERN]      list table, view, and sequence access privileges\n"));
 	fprintf(output, _("  \\drds [PATRN1 [PATRN2]] list per-database role settings\n"));
+	fprintf(output, _("  \\dRp[+] [PATTERN]      list replication publications\n"));
+	fprintf(output, _("  \\dRs[+] [PATTERN]      list replication subscriptions\n"));
 	fprintf(output, _("  \\ds[S+] [PATTERN]      list sequences\n"));
 	fprintf(output, _("  \\dt[S+] [PATTERN]      list tables\n"));
 	fprintf(output, _("  \\dT[S+] [PATTERN]      list data types\n"));
 	fprintf(output, _("  \\du[S+] [PATTERN]      list roles\n"));
 	fprintf(output, _("  \\dv[S+] [PATTERN]      list views\n"));
-	fprintf(output, _("  \\dE[S+] [PATTERN]      list foreign tables\n"));
 	fprintf(output, _("  \\dx[+]  [PATTERN]      list extensions\n"));
 	fprintf(output, _("  \\dy     [PATTERN]      list event triggers\n"));
 	fprintf(output, _("  \\l[+]   [PATTERN]      list databases\n"));
@@ -265,14 +277,16 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\H                     toggle HTML output mode (currently %s)\n"),
 			ON(pset.popt.topt.format == PRINT_HTML));
 	fprintf(output, _("  \\pset [NAME [VALUE]]   set table output option\n"
-					  "                         (NAME := {format|border|expanded|fieldsep|fieldsep_zero|footer|null|\n"
-					  "                         numericlocale|recordsep|recordsep_zero|tuples_only|title|tableattr|pager|\n"
-					  "                         unicode_border_linestyle|unicode_column_linestyle|unicode_header_linestyle})\n"));
+					  "                         (NAME := {border|columns|expanded|fieldsep|fieldsep_zero|\n"
+					  "                         footer|format|linestyle|null|numericlocale|pager|\n"
+					  "                         pager_min_lines|recordsep|recordsep_zero|tableattr|title|\n"
+					  "                         tuples_only|unicode_border_linestyle|\n"
+					  "                         unicode_column_linestyle|unicode_header_linestyle})\n"));
 	fprintf(output, _("  \\t [on|off]            show only rows (currently %s)\n"),
 			ON(pset.popt.topt.tuples_only));
 	fprintf(output, _("  \\T [STRING]            set HTML <table> tag attributes, or unset if none\n"));
 	fprintf(output, _("  \\x [on|off|auto]       toggle expanded output (currently %s)\n"),
-		pset.popt.topt.expanded == 2 ? "auto" : ON(pset.popt.topt.expanded));
+			pset.popt.topt.expanded == 2 ? "auto" : ON(pset.popt.topt.expanded));
 	fprintf(output, "\n");
 
 	fprintf(output, _("Connection\n"));
@@ -283,9 +297,9 @@ slashUsage(unsigned short int pager)
 	else
 		fprintf(output, _("  \\c[onnect] {[DBNAME|- USER|- HOST|- PORT|-] | conninfo}\n"
 						  "                         connect to new database (currently no connection)\n"));
+	fprintf(output, _("  \\conninfo              display information about current connection\n"));
 	fprintf(output, _("  \\encoding [ENCODING]   show or set client encoding\n"));
 	fprintf(output, _("  \\password [USERNAME]   securely change the password for a user\n"));
-	fprintf(output, _("  \\conninfo              display information about current connection\n"));
 	fprintf(output, "\n");
 
 	fprintf(output, _("Operating System\n"));
@@ -328,7 +342,7 @@ helpVariables(unsigned short int pager)
 	 * Windows builds currently print one more line than non-Windows builds.
 	 * Using the larger number is fine.
 	 */
-	output = PageOutput(88, pager ? &(pset.popt.topt) : NULL);
+	output = PageOutput(93, pager ? &(pset.popt.topt) : NULL);
 
 	fprintf(output, _("List of specially treated variables\n\n"));
 
@@ -338,7 +352,7 @@ helpVariables(unsigned short int pager)
 
 	fprintf(output, _("  AUTOCOMMIT         if set, successful SQL commands are automatically committed\n"));
 	fprintf(output, _("  COMP_KEYWORD_CASE  determines the case used to complete SQL key words\n"
-	"                     [lower, upper, preserve-lower, preserve-upper]\n"));
+					  "                     [lower, upper, preserve-lower, preserve-upper]\n"));
 	fprintf(output, _("  DBNAME             the currently connected database name\n"));
 	fprintf(output, _("  ECHO               controls what input is written to standard output\n"
 					  "                     [all, errors, none, queries]\n"));
@@ -349,9 +363,9 @@ helpVariables(unsigned short int pager)
 					  "                     (default: 0=unlimited)\n"));
 	fprintf(output, _("  HISTCONTROL        controls command history [ignorespace, ignoredups, ignoreboth]\n"));
 	fprintf(output, _("  HISTFILE           file name used to store the command history\n"));
-	fprintf(output, _("  HISTSIZE           the number of commands to store in the command history\n"));
+	fprintf(output, _("  HISTSIZE           max number of commands to store in the command history\n"));
 	fprintf(output, _("  HOST               the currently connected database server host\n"));
-	fprintf(output, _("  IGNOREEOF          if unset, sending an EOF to interactive session terminates application\n"));
+	fprintf(output, _("  IGNOREEOF          number of EOFs needed to terminate an interactive session\n"));
 	fprintf(output, _("  LASTOID            value of the last affected OID\n"));
 	fprintf(output, _("  ON_ERROR_ROLLBACK  if set, an error doesn't stop a transaction (uses implicit savepoints)\n"));
 	fprintf(output, _("  ON_ERROR_STOP      stop batch execution after error\n"));
@@ -360,11 +374,16 @@ helpVariables(unsigned short int pager)
 	fprintf(output, _("  PROMPT2            specifies the prompt used when a statement continues from a previous line\n"));
 	fprintf(output, _("  PROMPT3            specifies the prompt used during COPY ... FROM STDIN\n"));
 	fprintf(output, _("  QUIET              run quietly (same as -q option)\n"));
+	fprintf(output, _("  SERVER_VERSION_NAME  server's version (short string)\n"));
+	fprintf(output, _("  SERVER_VERSION_NUM   server's version (numeric format)\n"));
 	fprintf(output, _("  SHOW_CONTEXT       controls display of message context fields [never, errors, always]\n"));
 	fprintf(output, _("  SINGLELINE         end of line terminates SQL command mode (same as -S option)\n"));
 	fprintf(output, _("  SINGLESTEP         single-step mode (same as -s option)\n"));
 	fprintf(output, _("  USER               the currently connected database user\n"));
 	fprintf(output, _("  VERBOSITY          controls verbosity of error reports [default, verbose, terse]\n"));
+	fprintf(output, _("  VERSION            psql's version (verbose string)\n"));
+	fprintf(output, _("  VERSION_NAME       psql's version (short string)\n"));
+	fprintf(output, _("  VERSION_NUM        psql's version (numeric format)\n"));
 
 	fprintf(output, _("\nDisplay settings:\n"));
 	fprintf(output, _("Usage:\n"));
@@ -407,10 +426,10 @@ helpVariables(unsigned short int pager)
 	fprintf(output, _("  PGAPPNAME          same as the application_name connection parameter\n"));
 	fprintf(output, _("  PGDATABASE         same as the dbname connection parameter\n"));
 	fprintf(output, _("  PGHOST             same as the host connection parameter\n"));
-	fprintf(output, _("  PGPORT             same as the port connection parameter\n"));
-	fprintf(output, _("  PGUSER             same as the user connection parameter\n"));
 	fprintf(output, _("  PGPASSWORD         connection password (not recommended)\n"));
 	fprintf(output, _("  PGPASSFILE         password file name\n"));
+	fprintf(output, _("  PGPORT             same as the port connection parameter\n"));
+	fprintf(output, _("  PGUSER             same as the user connection parameter\n"));
 	fprintf(output, _("  PSQL_EDITOR, EDITOR, VISUAL\n"
 					  "                     editor used by the \\e, \\ef, and \\ev commands\n"));
 	fprintf(output, _("  PSQL_EDITOR_LINENUMBER_ARG\n"
@@ -477,6 +496,32 @@ helpSQL(const char *topic, unsigned short int pager)
 		}
 
 		ClosePager(output);
+
+		if (QL_MAX_CMD_LEN < CYPHER_MAX_CMD_LEN)
+		{
+			ncolumns = (screen_width - 3) / (CYPHER_MAX_CMD_LEN + 1);
+			ncolumns = Max(ncolumns, 1);
+		}
+		nrows = (CYPHER_HELP_COUNT + (ncolumns - 1)) / ncolumns;
+
+		output = PageOutput(nrows + 1, pager ? &(pset.popt.topt) : NULL);
+
+		fputs(_("Available Cypher help:\n"), output);
+
+		for (i = 0; i < nrows; i++)
+		{
+			fprintf(output, "  ");
+			for (j = 0; j < ncolumns - 1; j++)
+				fprintf(output, "%-*s",
+						QL_MAX_CMD_LEN + 1,
+						VALUE_OR_NULL(CYPHER_HELP[i + j * nrows].cmd));
+			if (i + j * nrows < CYPHER_HELP_COUNT)
+				fprintf(output, "%s",
+						VALUE_OR_NULL(CYPHER_HELP[i + j * nrows].cmd));
+			fputc('\n', output);
+		}
+
+		ClosePager(output);
 	}
 	else
 	{
@@ -509,7 +554,7 @@ helpSQL(const char *topic, unsigned short int pager)
 					while (topic[j] != ' ' && j++ <= len)
 						wordlen++;
 				}
-				if (wordlen >= len)		/* Don't try again if the same word */
+				if (wordlen >= len) /* Don't try again if the same word */
 				{
 					if (!output)
 						output = PageOutput(nl_count, pager ? &(pset.popt.topt) : NULL);
@@ -528,6 +573,19 @@ helpSQL(const char *topic, unsigned short int pager)
 
 					/* If we have an exact match, exit.  Fixes \h SELECT */
 					if (pg_strcasecmp(topic, QL_HELP[i].cmd) == 0)
+						break;
+				}
+			}
+
+			for (i = 0; CYPHER_HELP[i].cmd; i++)
+			{
+				if (pg_strncasecmp(topic, CYPHER_HELP[i].cmd, len) == 0 ||
+					strcmp(topic, "*") == 0)
+				{
+					nl_count += 5 + CYPHER_HELP[i].nl_count;
+
+					/* If we have an exact match, exit.  Fixes \h SELECT */
+					if (pg_strcasecmp(topic, CYPHER_HELP[i].cmd) == 0)
 						break;
 				}
 			}
@@ -556,6 +614,28 @@ helpSQL(const char *topic, unsigned short int pager)
 						break;
 				}
 			}
+
+			for (i = 0; CYPHER_HELP[i].cmd; i++)
+			{
+				if (pg_strncasecmp(topic, CYPHER_HELP[i].cmd, len) == 0 ||
+					strcmp(topic, "*") == 0)
+				{
+					PQExpBufferData buffer;
+
+					initPQExpBuffer(&buffer);
+					CYPHER_HELP[i].syntaxfunc(&buffer);
+					help_found = true;
+					fprintf(output, _("Cypher Command: %s\n"
+									  "Description: %s\n"
+									  "Syntax:\n%s\n\n"),
+							CYPHER_HELP[i].cmd,
+							_(CYPHER_HELP[i].help),
+							buffer.data);
+					/* If we have an exact match, exit.  Fixes \h SELECT */
+					if (pg_strcasecmp(topic, CYPHER_HELP[i].cmd) == 0)
+						break;
+				}
+			}
 			if (help_found)		/* Don't keep trying if we got a match */
 				break;
 		}
@@ -567,14 +647,12 @@ helpSQL(const char *topic, unsigned short int pager)
 	}
 }
 
-
-
 void
 print_copyright(void)
 {
 	puts(
 		 "Agens Graph\n\n"
-		 "Copyright (c) 2014-2017 Bitnine, Inc.  All Rights Reserved.\n\n"
+		 "Copyright (c) 2014-2018 Bitnine, Inc.  All Rights Reserved.\n\n"
 		 "Licensed under the Apache License, Version 2.0 (the \"License\");\n"
 		 "you may not use this file except in compliance with the License.\n"
 		 "You may obtain a copy of the License at\n\n"
@@ -586,21 +664,21 @@ print_copyright(void)
 		 "limitations under the License.\n\n\n"
 		 "PostgreSQL Database Management System\n"
 		 "(formerly known as Postgres, then as Postgres95)\n\n"
-		 "Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group\n\n"
+		 "Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group\n\n"
 		 "Portions Copyright (c) 1994, The Regents of the University of California\n\n"
-	"Permission to use, copy, modify, and distribute this software and its\n"
+		 "Permission to use, copy, modify, and distribute this software and its\n"
 		 "documentation for any purpose, without fee, and without a written agreement\n"
-	 "is hereby granted, provided that the above copyright notice and this\n"
-	   "paragraph and the following two paragraphs appear in all copies.\n\n"
+		 "is hereby granted, provided that the above copyright notice and this\n"
+		 "paragraph and the following two paragraphs appear in all copies.\n\n"
 		 "IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO ANY PARTY FOR\n"
 		 "DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING\n"
 		 "LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS\n"
 		 "DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE\n"
 		 "POSSIBILITY OF SUCH DAMAGE.\n\n"
-	  "THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,\n"
+		 "THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,\n"
 		 "INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY\n"
 		 "AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS\n"
 		 "ON AN \"AS IS\" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO\n"
-	"PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.\n"
+		 "PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.\n"
 		);
 }

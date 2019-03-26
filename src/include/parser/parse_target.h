@@ -4,7 +4,7 @@
  *	  handle target lists
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_target.h
@@ -20,7 +20,8 @@
 extern List *transformTargetList(ParseState *pstate, List *targetlist,
 					ParseExprKind exprKind);
 extern List *transformExpressionList(ParseState *pstate, List *exprlist,
-						ParseExprKind exprKind);
+						ParseExprKind exprKind, bool allowDefault);
+extern void resolveTargetListUnknowns(ParseState *pstate, List *targetlist);
 extern void markTargetListOrigins(ParseState *pstate, List *targetlist);
 extern TargetEntry *transformTargetEntry(ParseState *pstate,
 					 Node *node, Node *expr, ParseExprKind exprKind,
@@ -41,7 +42,5 @@ extern TupleDesc expandRecordVariable(ParseState *pstate, Var *var,
 					 int levelsup);
 extern char *FigureColname(Node *node);
 extern char *FigureIndexColname(Node *node);
-extern void wrapEdgeRefTargetList(ParseState *pstate, List *targetList);
-extern void stripEdgeRefTargetList(List *targetList);
 
-#endif   /* PARSE_TARGET_H */
+#endif							/* PARSE_TARGET_H */

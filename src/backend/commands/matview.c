@@ -3,7 +3,7 @@
  * matview.c
  *	  materialized view support
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,8 @@
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "commands/cluster.h"
 #include "commands/matview.h"
@@ -30,6 +32,7 @@
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
@@ -39,7 +42,6 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
-#include "utils/typcache.h"
 
 
 typedef struct
@@ -59,16 +61,13 @@ static void transientrel_startup(DestReceiver *self, int operation, TupleDesc ty
 static bool transientrel_receive(TupleTableSlot *slot, DestReceiver *self);
 static void transientrel_shutdown(DestReceiver *self);
 static void transientrel_destroy(DestReceiver *self);
-static void refresh_matview_datafill(DestReceiver *dest, Query *query,
+static uint64 refresh_matview_datafill(DestReceiver *dest, Query *query,
 						 const char *queryString);
-
 static char *make_temptable_name_n(char *tempname, int n);
-static void mv_GenerateOper(StringInfo buf, Oid opoid);
-
 static void refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 					   int save_sec_context);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
-
+static bool is_usable_unique_index(Relation indexRel);
 static void OpenMatViewIncrementalMaintenance(void);
 static void CloseMatViewIncrementalMaintenance(void);
 
@@ -100,9 +99,7 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 
 	((Form_pg_class) GETSTRUCT(tuple))->relispopulated = newstate;
 
-	simple_heap_update(pgrel, &tuple->t_self, tuple);
-
-	CatalogUpdateIndexes(pgrel, tuple);
+	CatalogTupleUpdate(pgrel, &tuple->t_self, tuple);
 
 	heap_freetuple(tuple);
 	heap_close(pgrel, RowExclusiveLock);
@@ -147,6 +144,7 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	Oid			relowner;
 	Oid			OIDNewHeap;
 	DestReceiver *dest;
+	uint64		processed = 0;
 	bool		concurrent;
 	LOCKMODE	lockmode;
 	char		relpersistence;
@@ -230,23 +228,12 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 		{
 			Oid			indexoid = lfirst_oid(indexoidscan);
 			Relation	indexRel;
-			Form_pg_index indexStruct;
 
 			indexRel = index_open(indexoid, AccessShareLock);
-			indexStruct = indexRel->rd_index;
-
-			if (indexStruct->indisunique &&
-				IndexIsValid(indexStruct) &&
-				RelationGetIndexExpressions(indexRel) == NIL &&
-				RelationGetIndexPredicate(indexRel) == NIL &&
-				indexStruct->indnatts > 0)
-			{
-				hasUniqueIndex = true;
-				index_close(indexRel, AccessShareLock);
-				break;
-			}
-
+			hasUniqueIndex = is_usable_unique_index(indexRel);
 			index_close(indexRel, AccessShareLock);
+			if (hasUniqueIndex)
+				break;
 		}
 
 		list_free(indexoidlist);
@@ -254,9 +241,9 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 		if (!hasUniqueIndex)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			   errmsg("cannot refresh materialized view \"%s\" concurrently",
-					  quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
-									   RelationGetRelationName(matviewRel))),
+					 errmsg("cannot refresh materialized view \"%s\" concurrently",
+							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
+													   RelationGetRelationName(matviewRel))),
 					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
 	}
 
@@ -264,8 +251,7 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	 * The stored query was rewritten at the time of the MV definition, but
 	 * has not been scribbled on by the planner.
 	 */
-	dataQuery = (Query *) linitial(actions);
-	Assert(IsA(dataQuery, Query));
+	dataQuery = linitial_node(Query, actions);
 
 	/*
 	 * Check for active uses of the relation in the current transaction, such
@@ -325,9 +311,7 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 
 	/* Generate the data, if wanted. */
 	if (!stmt->skipData)
-		refresh_matview_datafill(dest, dataQuery, queryString);
-
-	heap_close(matviewRel, NoLock);
+		processed = refresh_matview_datafill(dest, dataQuery, queryString);
 
 	/* Make the matview match the newly generated data. */
 	if (concurrent)
@@ -348,7 +332,21 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 		Assert(matview_maintenance_depth == old_depth);
 	}
 	else
+	{
 		refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
+
+		/*
+		 * Inform stats collector about our activity: basically, we truncated
+		 * the matview and inserted some new data.  (The concurrent code path
+		 * above doesn't need to worry about this because the inserts and
+		 * deletes it issues get counted by lower-level code.)
+		 */
+		pgstat_count_truncate(matviewRel);
+		if (!stmt->skipData)
+			pgstat_count_heap_insert(matviewRel, processed);
+	}
+
+	heap_close(matviewRel, NoLock);
 
 	/* Roll back any GUC changes */
 	AtEOXact_GUC(false, save_nestlevel);
@@ -363,8 +361,13 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 
 /*
  * refresh_matview_datafill
+ *
+ * Execute the given query, sending result rows to "dest" (which will
+ * insert them into the target matview).
+ *
+ * Returns number of rows inserted.
  */
-static void
+static uint64
 refresh_matview_datafill(DestReceiver *dest, Query *query,
 						 const char *queryString)
 {
@@ -372,6 +375,7 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 	PlannedStmt *plan;
 	QueryDesc  *queryDesc;
 	Query	   *copied_query;
+	uint64		processed;
 
 	/* Lock and rewrite, using a copy to preserve the original query. */
 	copied_query = copyObject(query);
@@ -401,13 +405,15 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 	/* Create a QueryDesc, redirecting output to our tuple receiver */
 	queryDesc = CreateQueryDesc(plan, queryString,
 								GetActiveSnapshot(), InvalidSnapshot,
-								dest, NULL, 0);
+								dest, NULL, NULL, 0);
 
 	/* call ExecutorStart to prepare the plan for execution */
 	ExecutorStart(queryDesc, EXEC_FLAG_WITHOUT_OIDS);
 
 	/* run the plan */
-	ExecutorRun(queryDesc, ForwardScanDirection, 0L);
+	ExecutorRun(queryDesc, ForwardScanDirection, 0L, true);
+
+	processed = queryDesc->estate->es_processed;
 
 	/* and clean up */
 	ExecutorFinish(queryDesc);
@@ -416,6 +422,8 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 	FreeQueryDesc(queryDesc);
 
 	PopActiveSnapshot();
+
+	return processed;
 }
 
 DestReceiver *
@@ -536,25 +544,6 @@ make_temptable_name_n(char *tempname, int n)
 	return namebuf.data;
 }
 
-static void
-mv_GenerateOper(StringInfo buf, Oid opoid)
-{
-	HeapTuple	opertup;
-	Form_pg_operator operform;
-
-	opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(opoid));
-	if (!HeapTupleIsValid(opertup))
-		elog(ERROR, "cache lookup failed for operator %u", opoid);
-	operform = (Form_pg_operator) GETSTRUCT(opertup);
-	Assert(operform->oprkind == 'b');
-
-	appendStringInfo(buf, "OPERATOR(%s.%s)",
-				quote_identifier(get_namespace_name(operform->oprnamespace)),
-					 NameStr(operform->oprname));
-
-	ReleaseSysCache(opertup);
-}
-
 /*
  * refresh_by_match_merge
  *
@@ -602,19 +591,18 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	List	   *indexoidlist;
 	ListCell   *indexoidscan;
 	int16		relnatts;
-	bool	   *usedForQual;
+	Oid		   *opUsedForQual;
 
 	initStringInfo(&querybuf);
 	matviewRel = heap_open(matviewOid, NoLock);
 	matviewname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
-										RelationGetRelationName(matviewRel));
+											 RelationGetRelationName(matviewRel));
 	tempRel = heap_open(tempOid, NoLock);
 	tempname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(tempRel)),
 										  RelationGetRelationName(tempRel));
 	diffname = make_temptable_name_n(tempname, 2);
 
 	relnatts = matviewRel->rd_rel->relnatts;
-	usedForQual = (bool *) palloc0(sizeof(bool) * relnatts);
 
 	/* Open SPI context. */
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -636,10 +624,10 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	appendStringInfo(&querybuf,
 					 "SELECT newdata FROM %s newdata "
 					 "WHERE newdata IS NOT NULL AND EXISTS "
-					 "(SELECT * FROM %s newdata2 WHERE newdata2 IS NOT NULL "
+					 "(SELECT 1 FROM %s newdata2 WHERE newdata2 IS NOT NULL "
 					 "AND newdata2 OPERATOR(pg_catalog.*=) newdata "
 					 "AND newdata2.ctid OPERATOR(pg_catalog.<>) "
-					 "newdata.ctid) LIMIT 1",
+					 "newdata.ctid)",
 					 tempname, tempname);
 	if (SPI_execute(querybuf.data, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
@@ -657,7 +645,7 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 				 errmsg("new data for materialized view \"%s\" contains duplicate rows without any null columns",
 						RelationGetRelationName(matviewRel)),
 				 errdetail("Row: %s",
-			SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1))));
+						   SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1))));
 	}
 
 	SetUserIdAndSecContext(relowner,
@@ -678,45 +666,82 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	 * include all rows.
 	 */
 	tupdesc = matviewRel->rd_att;
+	opUsedForQual = (Oid *) palloc0(sizeof(Oid) * relnatts);
 	foundUniqueIndex = false;
+
 	indexoidlist = RelationGetIndexList(matviewRel);
 
 	foreach(indexoidscan, indexoidlist)
 	{
 		Oid			indexoid = lfirst_oid(indexoidscan);
 		Relation	indexRel;
-		Form_pg_index indexStruct;
 
 		indexRel = index_open(indexoid, RowExclusiveLock);
-		indexStruct = indexRel->rd_index;
-
-		/*
-		 * We're only interested if it is unique, valid, contains no
-		 * expressions, and is not partial.
-		 */
-		if (indexStruct->indisunique &&
-			IndexIsValid(indexStruct) &&
-			RelationGetIndexExpressions(indexRel) == NIL &&
-			RelationGetIndexPredicate(indexRel) == NIL)
+		if (is_usable_unique_index(indexRel))
 		{
+			Form_pg_index indexStruct = indexRel->rd_index;
 			int			numatts = indexStruct->indnatts;
+			oidvector  *indclass;
+			Datum		indclassDatum;
+			bool		isnull;
 			int			i;
+
+			/* Must get indclass the hard way. */
+			indclassDatum = SysCacheGetAttr(INDEXRELID,
+											indexRel->rd_indextuple,
+											Anum_pg_index_indclass,
+											&isnull);
+			Assert(!isnull);
+			indclass = (oidvector *) DatumGetPointer(indclassDatum);
 
 			/* Add quals for all columns from this index. */
 			for (i = 0; i < numatts; i++)
 			{
 				int			attnum = indexStruct->indkey.values[i];
-				Oid			type;
+				Oid			opclass = indclass->values[i];
+				Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+				Oid			attrtype = attr->atttypid;
+				HeapTuple	cla_ht;
+				Form_pg_opclass cla_tup;
+				Oid			opfamily;
+				Oid			opcintype;
 				Oid			op;
-				const char *colname;
+				const char *leftop;
+				const char *rightop;
 
 				/*
-				 * Only include the column once regardless of how many times
-				 * it shows up in how many indexes.
+				 * Identify the equality operator associated with this index
+				 * column.  First we need to look up the column's opclass.
 				 */
-				if (usedForQual[attnum - 1])
+				cla_ht = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
+				if (!HeapTupleIsValid(cla_ht))
+					elog(ERROR, "cache lookup failed for opclass %u", opclass);
+				cla_tup = (Form_pg_opclass) GETSTRUCT(cla_ht);
+				Assert(cla_tup->opcmethod == BTREE_AM_OID);
+				opfamily = cla_tup->opcfamily;
+				opcintype = cla_tup->opcintype;
+				ReleaseSysCache(cla_ht);
+
+				op = get_opfamily_member(opfamily, opcintype, opcintype,
+										 BTEqualStrategyNumber);
+				if (!OidIsValid(op))
+					elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
+						 BTEqualStrategyNumber, opcintype, opcintype, opfamily);
+
+				/*
+				 * If we find the same column with the same equality semantics
+				 * in more than one index, we only need to emit the equality
+				 * clause once.
+				 *
+				 * Since we only remember the last equality operator, this
+				 * code could be fooled into emitting duplicate clauses given
+				 * multiple indexes with several different opclasses ... but
+				 * that's so unlikely it doesn't seem worth spending extra
+				 * code to avoid.
+				 */
+				if (opUsedForQual[attnum - 1] == op)
 					continue;
-				usedForQual[attnum - 1] = true;
+				opUsedForQual[attnum - 1] = op;
 
 				/*
 				 * Actually add the qual, ANDed with any others.
@@ -724,12 +749,15 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 				if (foundUniqueIndex)
 					appendStringInfoString(&querybuf, " AND ");
 
-				colname = quote_identifier(NameStr((tupdesc->attrs[attnum - 1])->attname));
-				appendStringInfo(&querybuf, "newdata.%s ", colname);
-				type = attnumTypeId(matviewRel, attnum);
-				op = lookup_type_cache(type, TYPECACHE_EQ_OPR)->eq_opr;
-				mv_GenerateOper(&querybuf, op);
-				appendStringInfo(&querybuf, " mv.%s", colname);
+				leftop = quote_qualified_identifier("newdata",
+													NameStr(attr->attname));
+				rightop = quote_qualified_identifier("mv",
+													 NameStr(attr->attname));
+
+				generate_operator_clause(&querybuf,
+										 leftop, attrtype,
+										 op,
+										 rightop, attrtype);
 
 				foundUniqueIndex = true;
 			}
@@ -742,11 +770,11 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	list_free(indexoidlist);
 
 	/*
-	 * There must be at least one unique index on the matview.
+	 * There must be at least one usable unique index on the matview.
 	 *
 	 * ExecRefreshMatView() checks that after taking the exclusive lock on the
 	 * matview. So at least one unique index is guaranteed to exist here
-	 * because the lock is still being held.
+	 * because the lock is still being held; so an Assert seems sufficient.
 	 */
 	Assert(foundUniqueIndex);
 
@@ -778,7 +806,7 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	/* Deletes must come before inserts; do them first. */
 	resetStringInfo(&querybuf);
 	appendStringInfo(&querybuf,
-				   "DELETE FROM %s mv WHERE ctid OPERATOR(pg_catalog.=) ANY "
+					 "DELETE FROM %s mv WHERE ctid OPERATOR(pg_catalog.=) ANY "
 					 "(SELECT diff.tid FROM %s diff "
 					 "WHERE diff.tid IS NOT NULL "
 					 "AND diff.newdata IS NULL)",
@@ -821,6 +849,51 @@ refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence)
 {
 	finish_heap_swap(matviewOid, OIDNewHeap, false, false, true, true,
 					 RecentXmin, ReadNextMultiXactId(), relpersistence);
+}
+
+/*
+ * Check whether specified index is usable for match merge.
+ */
+static bool
+is_usable_unique_index(Relation indexRel)
+{
+	Form_pg_index indexStruct = indexRel->rd_index;
+
+	/*
+	 * Must be unique, valid, immediate, non-partial, and be defined over
+	 * plain user columns (not expressions).  We also require it to be a
+	 * btree.  Even if we had any other unique index kinds, we'd not know how
+	 * to identify the corresponding equality operator, nor could we be sure
+	 * that the planner could implement the required FULL JOIN with non-btree
+	 * operators.
+	 */
+	if (indexStruct->indisunique &&
+		indexStruct->indimmediate &&
+		indexRel->rd_rel->relam == BTREE_AM_OID &&
+		IndexIsValid(indexStruct) &&
+		RelationGetIndexPredicate(indexRel) == NIL &&
+		indexStruct->indnatts > 0)
+	{
+		/*
+		 * The point of groveling through the index columns individually is to
+		 * reject both index expressions and system columns.  Currently,
+		 * matviews couldn't have OID columns so there's no way to create an
+		 * index on a system column; but maybe someday that wouldn't be true,
+		 * so let's be safe.
+		 */
+		int			numatts = indexStruct->indnatts;
+		int			i;
+
+		for (i = 0; i < numatts; i++)
+		{
+			int			attnum = indexStruct->indkey.values[i];
+
+			if (attnum <= 0)
+				return false;
+		}
+		return true;
+	}
+	return false;
 }
 
 

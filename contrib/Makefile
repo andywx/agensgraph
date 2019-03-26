@@ -6,6 +6,7 @@ include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = \
 		adminpack	\
+		amcheck		\
 		auth_delay	\
 		auto_explain	\
 		bloom		\
@@ -20,7 +21,6 @@ SUBDIRS = \
 		earthdistance	\
 		file_fdw	\
 		fuzzystrmatch	\
-		hadoop_fdw	\
 		hstore		\
 		intagg		\
 		intarray	\
@@ -32,18 +32,15 @@ SUBDIRS = \
 		passwordcheck	\
 		pg_buffercache	\
 		pg_freespacemap \
-		pg_hint_plan	\
 		pg_prewarm	\
 		pg_standby	\
 		pg_stat_statements \
-		pg_statsinfo	\
 		pg_trgm		\
 		pgcrypto	\
 		pgrowlocks	\
 		pgstattuple	\
 		pg_visibility	\
 		postgres_fdw	\
-		postgresql-hll	\
 		seg		\
 		spi		\
 		tablefunc	\
@@ -51,7 +48,6 @@ SUBDIRS = \
 		test_decoding	\
 		tsm_system_rows \
 		tsm_system_time \
-		tsearch2	\
 		unaccent	\
 		vacuumlo
 

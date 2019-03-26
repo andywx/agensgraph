@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/plan
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/planmain.h
@@ -23,7 +23,7 @@ typedef enum
 	FORCE_PARALLEL_OFF,
 	FORCE_PARALLEL_ON,
 	FORCE_PARALLEL_REGRESS
-}	ForceParallelMode;
+}			ForceParallelMode;
 
 /* GUC parameters */
 #define DEFAULT_CURSOR_TUPLE_FRACTION 0.1
@@ -55,10 +55,11 @@ extern ForeignScan *make_foreignscan(List *qptlist, List *qpqual,
 extern Plan *materialize_finished_plan(Plan *subplan);
 extern bool is_projection_capable_path(Path *path);
 extern bool is_projection_capable_plan(Plan *plan);
-extern ModifyGraph *make_modifygraph(PlannerInfo *root, bool canSetTag,
-						 GraphWriteOp operation, bool last, bool detach,
-						 Plan *subplan, List *pattern, List *targets,
-						 List *exprs, List *sets);
+extern ModifyGraph *make_modifygraph(PlannerInfo *root, GraphWriteOp operation,
+									 bool last, List *targets,
+									 Plan *subplan, uint32 nr_modify,
+									 bool detach, bool eagerness,
+									 List *pattern, List *exprs, List *sets);
 extern Dijkstra *make_dijkstra(PlannerInfo *root, List *tlist, Plan *subplan,
 							   AttrNumber weight, bool weight_out,
 							   AttrNumber end_id, AttrNumber edge_id,
@@ -95,6 +96,7 @@ extern void process_implied_equality(PlannerInfo *root,
 						 Expr *item2,
 						 Relids qualscope,
 						 Relids nullable_relids,
+						 Index security_level,
 						 bool below_outer_join,
 						 bool both_const);
 extern RestrictInfo *build_implied_join_equality(Oid opno,
@@ -102,15 +104,20 @@ extern RestrictInfo *build_implied_join_equality(Oid opno,
 							Expr *item1,
 							Expr *item2,
 							Relids qualscope,
-							Relids nullable_relids);
+							Relids nullable_relids,
+							Index security_level);
 extern void match_foreign_keys_to_quals(PlannerInfo *root);
 
 /*
  * prototypes for plan/analyzejoins.c
  */
 extern List *remove_useless_joins(PlannerInfo *root, List *joinlist);
+extern void reduce_unique_semijoins(PlannerInfo *root);
 extern bool query_supports_distinctness(Query *query);
 extern bool query_is_distinct_for(Query *query, List *colnos, List *opids);
+extern bool innerrel_is_unique(PlannerInfo *root,
+				   Relids outerrelids, RelOptInfo *innerrel,
+				   JoinType jointype, List *restrictlist, bool force_cache);
 
 /*
  * prototypes for plan/setrefs.c
@@ -122,4 +129,4 @@ extern void extract_query_dependencies(Node *query,
 						   List **invalItems,
 						   bool *hasRowSecurity);
 
-#endif   /* PLANMAIN_H */
+#endif							/* PLANMAIN_H */

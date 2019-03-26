@@ -29,7 +29,7 @@
  * No new entries ever get pushed into a -2-labeled child, either.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -45,6 +45,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/pg_locale.h"
+#include "utils/varlena.h"
 
 
 /*
@@ -212,8 +213,13 @@ spg_text_choose(PG_FUNCTION_ARGS)
 				out->result.splitTuple.prefixPrefixDatum =
 					formTextDatum(prefixStr, commonLen);
 			}
-			out->result.splitTuple.nodeLabel =
+			out->result.splitTuple.prefixNNodes = 1;
+			out->result.splitTuple.prefixNodeLabels =
+				(Datum *) palloc(sizeof(Datum));
+			out->result.splitTuple.prefixNodeLabels[0] =
 				Int16GetDatum(*(unsigned char *) (prefixStr + commonLen));
+
+			out->result.splitTuple.childNodeN = 0;
 
 			if (prefixSize - commonLen == 1)
 			{
@@ -280,7 +286,10 @@ spg_text_choose(PG_FUNCTION_ARGS)
 		out->resultType = spgSplitTuple;
 		out->result.splitTuple.prefixHasPrefix = in->hasPrefix;
 		out->result.splitTuple.prefixPrefixDatum = in->prefixDatum;
-		out->result.splitTuple.nodeLabel = Int16GetDatum(-2);
+		out->result.splitTuple.prefixNNodes = 1;
+		out->result.splitTuple.prefixNodeLabels = (Datum *) palloc(sizeof(Datum));
+		out->result.splitTuple.prefixNodeLabels[0] = Int16GetDatum(-2);
+		out->result.splitTuple.childNodeN = 0;
 		out->result.splitTuple.postfixHasPrefix = false;
 	}
 	else
@@ -559,8 +568,9 @@ spg_text_leaf_consistent(PG_FUNCTION_ARGS)
 
 	leafValue = DatumGetTextPP(in->leafDatum);
 
+	/* As above, in->reconstructedValue isn't toasted or short. */
 	if (DatumGetPointer(in->reconstructedValue))
-		reconstrValue = DatumGetTextP(in->reconstructedValue);
+		reconstrValue = (text *) DatumGetPointer(in->reconstructedValue);
 
 	Assert(reconstrValue == NULL ? level == 0 :
 		   VARSIZE_ANY_EXHDR(reconstrValue) == level);
@@ -603,22 +613,22 @@ spg_text_leaf_consistent(PG_FUNCTION_ARGS)
 			/* If asserts enabled, verify encoding of reconstructed string */
 			Assert(pg_verifymbstr(fullValue, fullLen, false));
 
-			r = varstr_cmp(fullValue, Min(queryLen, fullLen),
-						   VARDATA_ANY(query), Min(queryLen, fullLen),
+			r = varstr_cmp(fullValue, fullLen,
+						   VARDATA_ANY(query), queryLen,
 						   PG_GET_COLLATION());
 		}
 		else
 		{
 			/* Non-collation-aware comparison */
 			r = memcmp(fullValue, VARDATA_ANY(query), Min(queryLen, fullLen));
-		}
 
-		if (r == 0)
-		{
-			if (queryLen > fullLen)
-				r = -1;
-			else if (queryLen < fullLen)
-				r = 1;
+			if (r == 0)
+			{
+				if (queryLen > fullLen)
+					r = -1;
+				else if (queryLen < fullLen)
+					r = 1;
+			}
 		}
 
 		switch (strategy)

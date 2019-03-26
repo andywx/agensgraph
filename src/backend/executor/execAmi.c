@@ -3,7 +3,7 @@
  * execAmi.c
  *	  miscellaneous executor access method routines
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/executor/execAmi.c
@@ -23,14 +23,15 @@
 #include "executor/nodeBitmapOr.h"
 #include "executor/nodeCtescan.h"
 #include "executor/nodeCustom.h"
-#include "executor/nodeEager.h"
 #include "executor/nodeDijkstra.h"
 #include "executor/nodeForeignscan.h"
 #include "executor/nodeFunctionscan.h"
 #include "executor/nodeGather.h"
+#include "executor/nodeGatherMerge.h"
 #include "executor/nodeGroup.h"
 #include "executor/nodeGroup.h"
 #include "executor/nodeHash.h"
+#include "executor/nodeHash2Side.h"
 #include "executor/nodeHashjoin.h"
 #include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
@@ -40,16 +41,20 @@
 #include "executor/nodeMergeAppend.h"
 #include "executor/nodeMergejoin.h"
 #include "executor/nodeModifyTable.h"
+#include "executor/nodeNamedtuplestorescan.h"
 #include "executor/nodeNestloop.h"
 #include "executor/nodeNestloopVle.h"
+#include "executor/nodeProjectSet.h"
 #include "executor/nodeRecursiveunion.h"
 #include "executor/nodeResult.h"
 #include "executor/nodeSamplescan.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSetOp.h"
+#include "executor/nodeShortestpath.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeSubplan.h"
 #include "executor/nodeSubqueryscan.h"
+#include "executor/nodeTableFuncscan.h"
 #include "executor/nodeTidscan.h"
 #include "executor/nodeUnique.h"
 #include "executor/nodeValuesscan.h"
@@ -61,7 +66,6 @@
 #include "utils/syscache.h"
 
 
-static bool TargetListSupportsBackwardScan(List *targetlist);
 static bool IndexSupportsBackwardScan(Oid indexid);
 
 
@@ -122,7 +126,7 @@ ExecReScan(PlanState *node)
 			UpdateChangedParamSet(node->righttree, node->chgParam);
 	}
 
-	/* Shut down any SRFs in the plan node's targetlist */
+	/* Call expression callbacks */
 	if (node->ps_ExprContext)
 		ReScanExprContext(node->ps_ExprContext);
 
@@ -131,6 +135,10 @@ ExecReScan(PlanState *node)
 	{
 		case T_ResultState:
 			ExecReScanResult((ResultState *) node);
+			break;
+
+		case T_ProjectSetState:
+			ExecReScanProjectSet((ProjectSetState *) node);
 			break;
 
 		case T_ModifyTableState:
@@ -169,6 +177,10 @@ ExecReScan(PlanState *node)
 			ExecReScanGather((GatherState *) node);
 			break;
 
+		case T_GatherMergeState:
+			ExecReScanGatherMerge((GatherMergeState *) node);
+			break;
+
 		case T_IndexScanState:
 			ExecReScanIndexScan((IndexScanState *) node);
 			break;
@@ -197,12 +209,20 @@ ExecReScan(PlanState *node)
 			ExecReScanFunctionScan((FunctionScanState *) node);
 			break;
 
+		case T_TableFuncScanState:
+			ExecReScanTableFuncScan((TableFuncScanState *) node);
+			break;
+
 		case T_ValuesScanState:
 			ExecReScanValuesScan((ValuesScanState *) node);
 			break;
 
 		case T_CteScanState:
 			ExecReScanCteScan((CteScanState *) node);
+			break;
+
+		case T_NamedTuplestoreScanState:
+			ExecReScanNamedTuplestoreScan((NamedTuplestoreScanState *) node);
 			break;
 
 		case T_WorkTableScanState:
@@ -273,8 +293,12 @@ ExecReScan(PlanState *node)
 			ExecReScanLimit((LimitState *) node);
 			break;
 
-		case T_EagerState:
-			ExecReScanEager((EagerState *) node);
+		case T_ShortestpathState:
+			ExecReScanShortestpath((ShortestpathState *) node);
+			break;
+
+		case T_Hash2SideState:
+			ExecReScanHash2Side((Hash2SideState *) node);
 			break;
 
 		case T_DijkstraState:
@@ -294,24 +318,27 @@ ExecReScan(PlanState *node)
 }
 
 void
-ExecUpScan(PlanState *node)
+ExecNextContext(PlanState *node)
 {
 	switch (nodeTag(node))
 	{
-		case T_AppendState:
-			ExecUpScanAppend((AppendState *) node);
+		case T_SeqScanState:
+			ExecNextSeqScanContext((SeqScanState *) node);
 			break;
 		case T_IndexScanState:
-			ExecUpScanIndexScan((IndexScanState *) node);
+			ExecNextIndexScanContext((IndexScanState *) node);
 			break;
 		case T_IndexOnlyScanState:
-			ExecUpScanIndexOnlyScan((IndexOnlyScanState *) node);
+			ExecNextIndexOnlyScanContext((IndexOnlyScanState *) node);
 			break;
-		case T_SeqScanState:
-			ExecUpScanSeqScan((SeqScanState *) node);
+		case T_AppendState:
+			ExecNextAppendContext((AppendState *) node);
 			break;
 		case T_ResultState:
-			ExecUpScanResult((ResultState *) node);
+			ExecNextResultContext((ResultState *) node);
+			break;
+		case T_NestLoopState:
+			ExecNextNestLoopContext((NestLoopState *) node);
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
@@ -320,24 +347,27 @@ ExecUpScan(PlanState *node)
 }
 
 void
-ExecDownScan(PlanState *node)
+ExecPrevContext(PlanState *node)
 {
 	switch (nodeTag(node))
 	{
-		case T_AppendState:
-			ExecDownScanAppend((AppendState *) node);
+		case T_SeqScanState:
+			ExecPrevSeqScanContext((SeqScanState *) node);
 			break;
 		case T_IndexScanState:
-			ExecDownScanIndexScan((IndexScanState *) node);
+			ExecPrevIndexScanContext((IndexScanState *) node);
 			break;
 		case T_IndexOnlyScanState:
-			ExecDownScanIndexOnlyScan((IndexOnlyScanState *) node);
+			ExecPrevIndexOnlyScanContext((IndexOnlyScanState *) node);
 			break;
-		case T_SeqScanState:
-			ExecDownScanSeqScan((SeqScanState *) node);
+		case T_AppendState:
+			ExecPrevAppendContext((AppendState *) node);
 			break;
 		case T_ResultState:
-			ExecDownScanResult((ResultState *) node);
+			ExecPrevResultContext((ResultState *) node);
+			break;
+		case T_NestLoopState:
+			ExecPrevNestLoopContext((NestLoopState *) node);
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
@@ -466,11 +496,13 @@ ExecSupportsMarkRestore(Path *pathnode)
 			return true;
 
 		case T_CustomScan:
-			Assert(IsA(pathnode, CustomPath));
-			if (((CustomPath *) pathnode)->flags & CUSTOMPATH_SUPPORT_MARK_RESTORE)
-				return true;
-			return false;
+			{
+				CustomPath *customPath = castNode(CustomPath, pathnode);
 
+				if (customPath->flags & CUSTOMPATH_SUPPORT_MARK_RESTORE)
+					return true;
+				return false;
+			}
 		case T_Result:
 
 			/*
@@ -488,9 +520,6 @@ ExecSupportsMarkRestore(Path *pathnode)
 				Assert(IsA(pathnode, ResultPath));
 				return false;	/* childless Result */
 			}
-
-		case T_Eager:
-			return false;
 
 		default:
 			break;
@@ -525,8 +554,7 @@ ExecSupportsBackwardScan(Plan *node)
 	{
 		case T_Result:
 			if (outerPlan(node) != NULL)
-				return ExecSupportsBackwardScan(outerPlan(node)) &&
-					TargetListSupportsBackwardScan(node->targetlist);
+				return ExecSupportsBackwardScan(outerPlan(node));
 			else
 				return false;
 
@@ -543,13 +571,6 @@ ExecSupportsBackwardScan(Plan *node)
 				return true;
 			}
 
-		case T_SeqScan:
-		case T_TidScan:
-		case T_FunctionScan:
-		case T_ValuesScan:
-		case T_CteScan:
-			return TargetListSupportsBackwardScan(node->targetlist);
-
 		case T_SampleScan:
 			/* Simplify life for tablesample methods by disallowing this */
 			return false;
@@ -558,55 +579,39 @@ ExecSupportsBackwardScan(Plan *node)
 			return false;
 
 		case T_IndexScan:
-			return IndexSupportsBackwardScan(((IndexScan *) node)->indexid) &&
-				TargetListSupportsBackwardScan(node->targetlist);
+			return IndexSupportsBackwardScan(((IndexScan *) node)->indexid);
 
 		case T_IndexOnlyScan:
-			return IndexSupportsBackwardScan(((IndexOnlyScan *) node)->indexid) &&
-				TargetListSupportsBackwardScan(node->targetlist);
+			return IndexSupportsBackwardScan(((IndexOnlyScan *) node)->indexid);
 
 		case T_SubqueryScan:
-			return ExecSupportsBackwardScan(((SubqueryScan *) node)->subplan) &&
-				TargetListSupportsBackwardScan(node->targetlist);
+			return ExecSupportsBackwardScan(((SubqueryScan *) node)->subplan);
 
 		case T_CustomScan:
 			{
 				uint32		flags = ((CustomScan *) node)->flags;
 
-				if ((flags & CUSTOMPATH_SUPPORT_BACKWARD_SCAN) &&
-					TargetListSupportsBackwardScan(node->targetlist))
+				if (flags & CUSTOMPATH_SUPPORT_BACKWARD_SCAN)
 					return true;
 			}
 			return false;
 
+		case T_SeqScan:
+		case T_TidScan:
+		case T_FunctionScan:
+		case T_ValuesScan:
+		case T_CteScan:
 		case T_Material:
 		case T_Sort:
-			/* these don't evaluate tlist */
 			return true;
 
 		case T_LockRows:
 		case T_Limit:
-			/* these don't evaluate tlist */
 			return ExecSupportsBackwardScan(outerPlan(node));
-
-		case T_Eager:
-			return false;
 
 		default:
 			return false;
 	}
-}
-
-/*
- * If the tlist contains set-returning functions, we can't support backward
- * scan, because the TupFromTlist code is direction-ignorant.
- */
-static bool
-TargetListSupportsBackwardScan(List *targetlist)
-{
-	if (expression_returns_set((Node *) targetlist))
-		return false;
-	return true;
 }
 
 /*
@@ -653,7 +658,9 @@ ExecMaterializesOutput(NodeTag plantype)
 	{
 		case T_Material:
 		case T_FunctionScan:
+		case T_TableFuncScan:
 		case T_CteScan:
+		case T_NamedTuplestoreScan:
 		case T_WorkTableScan:
 		case T_Sort:
 			return true;

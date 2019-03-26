@@ -13,11 +13,12 @@
 #include "nodes/parsenodes.h"
 
 extern char *graph_path;
-extern bool DisableGraphDML;
+extern bool enableGraphDML;
 
 extern char *get_graph_path(bool lookup_cache);
 extern Oid get_graph_path_oid(void);
 
-extern Oid GraphCreate(CreateGraphStmt *stmt, const char *queryString);
+extern Oid GraphCreate(CreateGraphStmt *stmt, const char *queryString,
+					   int stmt_location, int stmt_len);
 
 #endif	/* AG_GRAPH_FN_H */

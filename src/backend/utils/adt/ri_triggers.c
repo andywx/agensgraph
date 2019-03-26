@@ -13,7 +13,7 @@
  *	plan --- consider improving this someday.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  *
  * src/backend/utils/adt/ri_triggers.c
  *
@@ -119,14 +119,11 @@ typedef struct RI_ConstraintInfo
 	char		confdeltype;	/* foreign key's ON DELETE action */
 	char		confmatchtype;	/* foreign key's match type */
 	int			nkeys;			/* number of key columns */
-	int16		pk_attnums[RI_MAX_NUMKEYS];		/* attnums of referenced cols */
-	int16		fk_attnums[RI_MAX_NUMKEYS];		/* attnums of referencing cols */
-	Oid			pf_eq_oprs[RI_MAX_NUMKEYS];		/* equality operators (PK =
-												 * FK) */
-	Oid			pp_eq_oprs[RI_MAX_NUMKEYS];		/* equality operators (PK =
-												 * PK) */
-	Oid			ff_eq_oprs[RI_MAX_NUMKEYS];		/* equality operators (FK =
-												 * FK) */
+	int16		pk_attnums[RI_MAX_NUMKEYS]; /* attnums of referenced cols */
+	int16		fk_attnums[RI_MAX_NUMKEYS]; /* attnums of referencing cols */
+	Oid			pf_eq_oprs[RI_MAX_NUMKEYS]; /* equality operators (PK = FK) */
+	Oid			pp_eq_oprs[RI_MAX_NUMKEYS]; /* equality operators (PK = PK) */
+	Oid			ff_eq_oprs[RI_MAX_NUMKEYS]; /* equality operators (FK = FK) */
 	dlist_node	valid_link;		/* Link in list of valid entries */
 } RI_ConstraintInfo;
 
@@ -208,7 +205,6 @@ static void ri_GenerateQual(StringInfo buf,
 				const char *leftop, Oid leftoptype,
 				Oid opoid,
 				const char *rightop, Oid rightoptype);
-static void ri_add_cast_to(StringInfo buf, Oid typid);
 static void ri_GenerateQualCollation(StringInfo buf, Oid collation);
 static int ri_NullCheck(HeapTuple tup,
 			 const RI_ConstraintInfo *riinfo, bool rel_is_pk);
@@ -579,7 +575,7 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 	result = ri_PerformCheck(riinfo, &qkey, qplan,
 							 fk_rel, pk_rel,
 							 old_row, NULL,
-							 true,		/* treat like update */
+							 true,	/* treat like update */
 							 SPI_OK_SELECT);
 
 	if (SPI_finish() != SPI_OK_FINISH)
@@ -771,7 +767,7 @@ ri_restrict_del(TriggerData *trigdata, bool is_no_action)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, NULL,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_SELECT);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -994,7 +990,7 @@ ri_restrict_upd(TriggerData *trigdata, bool is_no_action)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, NULL,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_SELECT);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -1150,7 +1146,7 @@ RI_FKey_cascade_del(PG_FUNCTION_ARGS)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, NULL,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_DELETE);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -1331,7 +1327,7 @@ RI_FKey_cascade_upd(PG_FUNCTION_ARGS)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, new_row,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_UPDATE);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -1496,7 +1492,7 @@ RI_FKey_setnull_del(PG_FUNCTION_ARGS)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, NULL,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_UPDATE);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -1672,7 +1668,7 @@ RI_FKey_setnull_upd(PG_FUNCTION_ARGS)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, NULL,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_UPDATE);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -1838,7 +1834,7 @@ RI_FKey_setdefault_del(PG_FUNCTION_ARGS)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, NULL,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_UPDATE);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -2029,7 +2025,7 @@ RI_FKey_setdefault_upd(PG_FUNCTION_ARGS)
 			ri_PerformCheck(riinfo, &qkey, qplan,
 							fk_rel, pk_rel,
 							old_row, NULL,
-							true,		/* must detect new rows */
+							true,	/* must detect new rows */
 							SPI_OK_UPDATE);
 
 			if (SPI_finish() != SPI_OK_FINISH)
@@ -2560,13 +2556,10 @@ quoteRelationName(char *buffer, Relation rel)
 /*
  * ri_GenerateQual --- generate a WHERE clause equating two variables
  *
- * The idea is to append " sep leftop op rightop" to buf.  The complexity
- * comes from needing to be sure that the parser will select the desired
- * operator.  We always name the operator using OPERATOR(schema.op) syntax
- * (readability isn't a big priority here), so as to avoid search-path
- * uncertainties.  We have to emit casts too, if either input isn't already
- * the input type of the operator; else we are at the mercy of the parser's
- * heuristics for ambiguous-operator resolution.
+ * This basically appends " sep leftop op rightop" to buf, adding casts
+ * and schema qualification as needed to ensure that the parser will select
+ * the operator we specify.  leftop and rightop should be parenthesized
+ * if they aren't variables or parameters.
  */
 static void
 ri_GenerateQual(StringInfo buf,
@@ -2575,60 +2568,9 @@ ri_GenerateQual(StringInfo buf,
 				Oid opoid,
 				const char *rightop, Oid rightoptype)
 {
-	HeapTuple	opertup;
-	Form_pg_operator operform;
-	char	   *oprname;
-	char	   *nspname;
-
-	opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(opoid));
-	if (!HeapTupleIsValid(opertup))
-		elog(ERROR, "cache lookup failed for operator %u", opoid);
-	operform = (Form_pg_operator) GETSTRUCT(opertup);
-	Assert(operform->oprkind == 'b');
-	oprname = NameStr(operform->oprname);
-
-	nspname = get_namespace_name(operform->oprnamespace);
-
-	appendStringInfo(buf, " %s %s", sep, leftop);
-	if (leftoptype != operform->oprleft)
-		ri_add_cast_to(buf, operform->oprleft);
-	appendStringInfo(buf, " OPERATOR(%s.", quote_identifier(nspname));
-	appendStringInfoString(buf, oprname);
-	appendStringInfo(buf, ") %s", rightop);
-	if (rightoptype != operform->oprright)
-		ri_add_cast_to(buf, operform->oprright);
-
-	ReleaseSysCache(opertup);
-}
-
-/*
- * Add a cast specification to buf.  We spell out the type name the hard way,
- * intentionally not using format_type_be().  This is to avoid corner cases
- * for CHARACTER, BIT, and perhaps other types, where specifying the type
- * using SQL-standard syntax results in undesirable data truncation.  By
- * doing it this way we can be certain that the cast will have default (-1)
- * target typmod.
- */
-static void
-ri_add_cast_to(StringInfo buf, Oid typid)
-{
-	HeapTuple	typetup;
-	Form_pg_type typform;
-	char	   *typname;
-	char	   *nspname;
-
-	typetup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
-	if (!HeapTupleIsValid(typetup))
-		elog(ERROR, "cache lookup failed for type %u", typid);
-	typform = (Form_pg_type) GETSTRUCT(typetup);
-
-	typname = NameStr(typform->typname);
-	nspname = get_namespace_name(typform->typnamespace);
-
-	appendStringInfo(buf, "::%s.%s",
-					 quote_identifier(nspname), quote_identifier(typname));
-
-	ReleaseSysCache(typetup);
+	appendStringInfo(buf, " %s ", sep);
+	generate_operator_clause(buf, leftop, leftoptype, opoid,
+							 rightop, rightoptype);
 }
 
 /*
@@ -2721,7 +2663,7 @@ ri_CheckTrigger(FunctionCallInfo fcinfo, const char *funcname, int tgkind)
 		!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-			   errmsg("function \"%s\" must be fired AFTER ROW", funcname)));
+				 errmsg("function \"%s\" must be fired AFTER ROW", funcname)));
 
 	switch (tgkind)
 	{
@@ -2764,8 +2706,8 @@ ri_FetchConstraintInfo(Trigger *trigger, Relation trig_rel, bool rel_is_pk)
 	if (!OidIsValid(constraintOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-		  errmsg("no pg_constraint entry for trigger \"%s\" on table \"%s\"",
-				 trigger->tgname, RelationGetRelationName(trig_rel)),
+				 errmsg("no pg_constraint entry for trigger \"%s\" on table \"%s\"",
+						trigger->tgname, RelationGetRelationName(trig_rel)),
 				 errhint("Remove this referential integrity trigger and its mates, then do ALTER TABLE ADD CONSTRAINT.")));
 
 	/* Find or create a hashtable entry for the constraint */
@@ -2837,7 +2779,7 @@ ri_LoadConstraintInfo(Oid constraintOid)
 	/* And extract data */
 	Assert(riinfo->constraint_id == constraintOid);
 	riinfo->oidHashValue = GetSysCacheHashValue1(CONSTROID,
-											ObjectIdGetDatum(constraintOid));
+												 ObjectIdGetDatum(constraintOid));
 	memcpy(&riinfo->conname, &conForm->conname, sizeof(NameData));
 	riinfo->pk_relid = conForm->confrelid;
 	riinfo->fk_relid = conForm->conrelid;
@@ -3111,7 +3053,7 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	 */
 	if (IsolationUsesXactSnapshot() && detectNewRows)
 	{
-		CommandCounterIncrement();		/* be sure all my own work is visible */
+		CommandCounterIncrement();	/* be sure all my own work is visible */
 		test_snapshot = GetLatestSnapshot();
 		crosscheck_snapshot = GetTransactionSnapshot();
 	}
@@ -3159,7 +3101,7 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	/* XXX wouldn't it be clearer to do this part at the caller? */
 	if (qkey->constr_queryno != RI_PLAN_CHECK_LOOKUPPK_FROM_PK &&
 		expect_OK == SPI_OK_SELECT &&
-	(SPI_processed == 0) == (qkey->constr_queryno == RI_PLAN_CHECK_LOOKUPPK))
+		(SPI_processed == 0) == (qkey->constr_queryno == RI_PLAN_CHECK_LOOKUPPK))
 		ri_ReportViolation(riinfo,
 						   pk_rel, fk_rel,
 						   new_tuple ? new_tuple : old_tuple,
@@ -3330,9 +3272,9 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 						NameStr(riinfo->conname),
 						RelationGetRelationName(fk_rel)),
 				 has_perm ?
-			errdetail("Key (%s)=(%s) is still referenced from table \"%s\".",
-					  key_names.data, key_values.data,
-					  RelationGetRelationName(fk_rel)) :
+				 errdetail("Key (%s)=(%s) is still referenced from table \"%s\".",
+						   key_names.data, key_values.data,
+						   RelationGetRelationName(fk_rel)) :
 				 errdetail("Key is still referenced from table \"%s\".",
 						   RelationGetRelationName(fk_rel)),
 				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
@@ -3584,11 +3526,11 @@ ri_AttributesEqual(Oid eq_opr, Oid typeid,
 	{
 		oldvalue = FunctionCall3(&entry->cast_func_finfo,
 								 oldvalue,
-								 Int32GetDatum(-1),		/* typmod */
+								 Int32GetDatum(-1), /* typmod */
 								 BoolGetDatum(false));	/* implicit coercion */
 		newvalue = FunctionCall3(&entry->cast_func_finfo,
 								 newvalue,
-								 Int32GetDatum(-1),		/* typmod */
+								 Int32GetDatum(-1), /* typmod */
 								 BoolGetDatum(false));	/* implicit coercion */
 	}
 
@@ -3663,7 +3605,7 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 		op_input_types(eq_opr, &lefttype, &righttype);
 		Assert(lefttype == righttype);
 		if (typeid == lefttype)
-			castfunc = InvalidOid;		/* simplest case */
+			castfunc = InvalidOid;	/* simplest case */
 		else
 		{
 			pathtype = find_coercion_pathway(lefttype, typeid,

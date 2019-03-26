@@ -5,7 +5,7 @@
  *
  * All the actual insertion logic is in spgdoinsert.c.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 
 #include "access/genam.h"
 #include "access/spgist_private.h"
+#include "access/spgxlog.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
@@ -31,6 +32,7 @@
 typedef struct
 {
 	SpGistState spgstate;		/* SPGiST's working state */
+	int64		indtuples;		/* total number of tuples indexed */
 	MemoryContext tmpCtx;		/* per-tuple temporary context */
 } SpGistBuildState;
 
@@ -57,6 +59,9 @@ spgistBuildCallback(Relation index, HeapTuple htup, Datum *values,
 	{
 		MemoryContextReset(buildstate->tmpCtx);
 	}
+
+	/* Update total tuple count */
+	buildstate->indtuples += 1;
 
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextReset(buildstate->tmpCtx);
@@ -131,9 +136,10 @@ spgbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	initSpGistState(&buildstate.spgstate, index);
 	buildstate.spgstate.isBuild = true;
+	buildstate.indtuples = 0;
 
 	buildstate.tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
-										   "SP-GiST build temporary context",
+											  "SP-GiST build temporary context",
 											  ALLOCSET_DEFAULT_SIZES);
 
 	reltuples = IndexBuildHeapScan(heap, index, indexInfo, true,
@@ -144,7 +150,8 @@ spgbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	SpGistUpdateMetaPage(index);
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
-	result->heap_tuples = result->index_tuples = reltuples;
+	result->heap_tuples = reltuples;
+	result->index_tuples = buildstate.indtuples;
 
 	return result;
 }
@@ -163,10 +170,10 @@ spgbuildempty(Relation index)
 
 	/*
 	 * Write the page and log it unconditionally.  This is important
-	 * particularly for indexes created on tablespaces and databases
-	 * whose creation happened after the last redo pointer as recovery
-	 * removes any of their existing content when the corresponding
-	 * create records are replayed.
+	 * particularly for indexes created on tablespaces and databases whose
+	 * creation happened after the last redo pointer as recovery removes any
+	 * of their existing content when the corresponding create records are
+	 * replayed.
 	 */
 	PageSetChecksumInplace(page, SPGIST_METAPAGE_BLKNO);
 	smgrwrite(index->rd_smgr, INIT_FORKNUM, SPGIST_METAPAGE_BLKNO,
@@ -206,7 +213,8 @@ spgbuildempty(Relation index)
 bool
 spginsert(Relation index, Datum *values, bool *isnull,
 		  ItemPointer ht_ctid, Relation heapRel,
-		  IndexUniqueCheck checkUnique)
+		  IndexUniqueCheck checkUnique,
+		  IndexInfo *indexInfo)
 {
 	SpGistState spgstate;
 	MemoryContext oldCtx;

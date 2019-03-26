@@ -3,7 +3,7 @@
  * indexcmds.c
  *	  POSTGRES define and remove index code.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -53,6 +53,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
@@ -71,8 +72,6 @@ static void ComputeIndexAttrs(IndexInfo *indexInfo,
 				  char *accessMethodName, Oid accessMethodId,
 				  bool amcanorder,
 				  bool isconstraint);
-static Oid GetIndexOpClass(List *opclass, Oid attrType,
-				char *accessMethodName, Oid accessMethodId);
 static char *ChooseIndexName(const char *tabname, Oid namespaceId,
 				List *colnames, List *exclusionOpNames,
 				bool primary, bool isconstraint);
@@ -182,10 +181,12 @@ CheckIndexCompatible(Oid oldId,
 	indexInfo = makeNode(IndexInfo);
 	indexInfo->ii_Expressions = NIL;
 	indexInfo->ii_ExpressionsState = NIL;
-	indexInfo->ii_PredicateState = NIL;
+	indexInfo->ii_PredicateState = NULL;
 	indexInfo->ii_ExclusionOps = NULL;
 	indexInfo->ii_ExclusionProcs = NULL;
 	indexInfo->ii_ExclusionStrats = NULL;
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
 	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
 	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
 	classObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
@@ -294,8 +295,11 @@ CheckIndexCompatible(Oid oldId,
  * 'indexRelationId': normally InvalidOid, but during bootstrap can be
  *		nonzero to specify a preselected OID for the index.
  * 'is_alter_table': this is due to an ALTER rather than a CREATE operation.
- * 'check_rights': check for CREATE rights in the namespace.  (This should
- *		be true except when ALTER is deleting/recreating an index.)
+ * 'check_rights': check for CREATE rights in namespace and tablespace.  (This
+ *		should be true except when ALTER is deleting/recreating an index.)
+ * 'check_not_in_use': check for table not already in use in current session.
+ *		This should be true unless caller is holding the table open, in which
+ *		case the caller had better have checked it earlier.
  * 'skip_build': make the catalog entries but leave the index file empty;
  *		it will be filled later.
  * 'quiet': suppress the NOTICE chatter ordinarily provided for constraints.
@@ -308,6 +312,7 @@ DefineIndex(Oid relationId,
 			Oid indexRelationId,
 			bool is_alter_table,
 			bool check_rights,
+			bool check_not_in_use,
 			bool skip_build,
 			bool quiet)
 {
@@ -385,6 +390,11 @@ DefineIndex(Oid relationId,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot create index on foreign table \"%s\"",
 							RelationGetRelationName(rel))));
+		else if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot create index on partitioned table \"%s\"",
+							RelationGetRelationName(rel))));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -399,6 +409,15 @@ DefineIndex(Oid relationId,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot create indexes on temporary tables of other sessions")));
+
+	/*
+	 * Unless our caller vouches for having checked this already, insist that
+	 * the table not be in use by our own session, either.  Otherwise we might
+	 * fail to make entries in the new index (for instance, if an INSERT or
+	 * UPDATE is in progress and has already made its list of target indexes).
+	 */
+	if (check_not_in_use)
+		CheckTableNotInUse(rel, "CREATE INDEX");
 
 	/*
 	 * Verify we (still) have CREATE rights in the rel's namespace.
@@ -431,8 +450,9 @@ DefineIndex(Oid relationId,
 		/* note InvalidOid is OK in this case */
 	}
 
-	/* Check permissions except when using database's default */
-	if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
+	/* Check tablespace permissions */
+	if (check_rights &&
+		OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
 	{
 		AclResult	aclresult;
 
@@ -501,26 +521,21 @@ DefineIndex(Oid relationId,
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
 	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
 
-	if (strcmp(accessMethodName, "hash") == 0 &&
-		RelationNeedsWAL(rel))
-		ereport(WARNING,
-				(errmsg("hash indexes are not WAL-logged and their use is discouraged")));
-
 	if (stmt->unique && !amRoutine->amcanunique)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			   errmsg("access method \"%s\" does not support unique indexes",
-					  accessMethodName)));
+				 errmsg("access method \"%s\" does not support unique indexes",
+						accessMethodName)));
 	if (numberOfAttributes > 1 && !amRoutine->amcanmulticol)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		  errmsg("access method \"%s\" does not support multicolumn indexes",
-				 accessMethodName)));
+				 errmsg("access method \"%s\" does not support multicolumn indexes",
+						accessMethodName)));
 	if (stmt->excludeOpNames && amRoutine->amgettuple == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		errmsg("access method \"%s\" does not support exclusion constraints",
-			   accessMethodName)));
+				 errmsg("access method \"%s\" does not support exclusion constraints",
+						accessMethodName)));
 
 	amcanorder = amRoutine->amcanorder;
 	amoptions = amRoutine->amoptions;
@@ -551,7 +566,7 @@ DefineIndex(Oid relationId,
 	indexInfo->ii_Expressions = NIL;	/* for now */
 	indexInfo->ii_ExpressionsState = NIL;
 	indexInfo->ii_Predicate = make_ands_implicit((Expr *) stmt->whereClause);
-	indexInfo->ii_PredicateState = NIL;
+	indexInfo->ii_PredicateState = NULL;
 	indexInfo->ii_ExclusionOps = NULL;
 	indexInfo->ii_ExclusionProcs = NULL;
 	indexInfo->ii_ExclusionStrats = NULL;
@@ -560,6 +575,8 @@ DefineIndex(Oid relationId,
 	indexInfo->ii_ReadyForInserts = !stmt->concurrent;
 	indexInfo->ii_Concurrent = stmt->concurrent;
 	indexInfo->ii_BrokenHotChain = false;
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
 
 	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
 	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
@@ -589,7 +606,7 @@ DefineIndex(Oid relationId,
 		if (attno < 0 && attno != ObjectIdAttributeNumber)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			   errmsg("index creation on system columns is not supported")));
+					 errmsg("index creation on system columns is not supported")));
 	}
 
 	/*
@@ -609,7 +626,7 @@ DefineIndex(Oid relationId,
 							  indexattrs))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("index creation on system columns is not supported")));
+						 errmsg("index creation on system columns is not supported")));
 		}
 	}
 
@@ -630,14 +647,14 @@ DefineIndex(Oid relationId,
 		else
 		{
 			elog(ERROR, "unknown constraint type");
-			constraint_type = NULL;		/* keep compiler quiet */
+			constraint_type = NULL; /* keep compiler quiet */
 		}
 
 		ereport(DEBUG1,
-		  (errmsg("%s %s will create implicit index \"%s\" for table \"%s\"",
-				  is_alter_table ? "ALTER TABLE / ADD" : "CREATE TABLE /",
-				  constraint_type,
-				  indexRelationName, RelationGetRelationName(rel))));
+				(errmsg("%s %s will create implicit index \"%s\" for table \"%s\"",
+						is_alter_table ? "ALTER TABLE / ADD" : "CREATE TABLE /",
+						constraint_type,
+						indexRelationName, RelationGetRelationName(rel))));
 	}
 
 	/*
@@ -832,6 +849,20 @@ DefineIndex(Oid relationId,
 	UnregisterSnapshot(snapshot);
 
 	/*
+	 * The snapshot subsystem could still contain registered snapshots that
+	 * are holding back our process's advertised xmin; in particular, if
+	 * default_transaction_isolation = serializable, there is a transaction
+	 * snapshot that is still active.  The CatalogSnapshot is likewise a
+	 * hazard.  To ensure no deadlocks, we must commit and start yet another
+	 * transaction, and do our wait before any snapshot has been taken in it.
+	 */
+	CommitTransactionCommand();
+	StartTransactionCommand();
+
+	/* We should now definitely not be advertising any xmin. */
+	Assert(MyPgXact->xmin == InvalidTransactionId);
+
+	/*
 	 * The index is now valid in the sense that it contains all currently
 	 * interesting tuples.  But since it might not contain tuples deleted just
 	 * before the reference snap was taken, we have to wait out any
@@ -882,7 +913,7 @@ DefineIndex(Oid relationId,
 
 			newer_snapshots = GetCurrentVirtualXIDs(limitXmin,
 													true, false,
-										 PROC_IS_AUTOVACUUM | PROC_IN_VACUUM,
+													PROC_IS_AUTOVACUUM | PROC_IN_VACUUM,
 													&n_newer_snapshots);
 			for (j = i; j < n_old_snapshots; j++)
 			{
@@ -894,7 +925,7 @@ DefineIndex(Oid relationId,
 												   newer_snapshots[k]))
 						break;
 				}
-				if (k >= n_newer_snapshots)		/* not there anymore */
+				if (k >= n_newer_snapshots) /* not there anymore */
 					SetInvalidVirtualTransactionId(old_snapshots[j]);
 			}
 			pfree(newer_snapshots);
@@ -981,7 +1012,7 @@ CheckPredicate(Expr *predicate)
 	if (CheckMutability(predicate))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-		   errmsg("functions in index predicate must be marked IMMUTABLE")));
+				 errmsg("functions in index predicate must be marked IMMUTABLE")));
 }
 
 /*
@@ -1047,8 +1078,8 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 				if (isconstraint)
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
-						  errmsg("column \"%s\" named in key does not exist",
-								 attribute->name)));
+							 errmsg("column \"%s\" named in key does not exist",
+									attribute->name)));
 				else
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
@@ -1147,10 +1178,10 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 		/*
 		 * Identify the opclass to use.
 		 */
-		classOidP[attn] = GetIndexOpClass(attribute->opclass,
-										  atttype,
-										  accessMethodName,
-										  accessMethodId);
+		classOidP[attn] = ResolveOpClass(attribute->opclass,
+										 atttype,
+										 accessMethodName,
+										 accessMethodId);
 
 		/*
 		 * Identify the exclusion operator, if any.
@@ -1257,10 +1288,13 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 
 /*
  * Resolve possibly-defaulted operator class specification
+ *
+ * Note: This is used to resolve operator class specification in index and
+ * partition key definitions.
  */
-static Oid
-GetIndexOpClass(List *opclass, Oid attrType,
-				char *accessMethodName, Oid accessMethodId)
+Oid
+ResolveOpClass(List *opclass, Oid attrType,
+			   char *accessMethodName, Oid accessMethodId)
 {
 	char	   *schemaname;
 	char	   *opcname;
@@ -1356,7 +1390,7 @@ GetIndexOpClass(List *opclass, Oid attrType,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("operator class \"%s\" does not accept data type %s",
-					  NameListToString(opclass), format_type_be(attrType))));
+						NameListToString(opclass), format_type_be(attrType))));
 
 	ReleaseSysCache(tuple);
 
@@ -1445,8 +1479,8 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
 	if (nexact > 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
-		errmsg("there are multiple default operator classes for data type %s",
-			   format_type_be(type_id))));
+				 errmsg("there are multiple default operator classes for data type %s",
+						format_type_be(type_id))));
 
 	if (nexact == 1 ||
 		ncompatiblepreferred == 1 ||
@@ -1459,7 +1493,8 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
 /*
  *	makeObjectName()
  *
- *	Create a name for an implicitly created index, sequence, constraint, etc.
+ *	Create a name for an implicitly created index, sequence, constraint,
+ *	extended statistics, etc.
  *
  *	The parameters are typically: the original table name, the original field
  *	name, and a "type" string (such as "seq" or "pkey").    The field name
@@ -1635,6 +1670,8 @@ ChooseIndexName(const char *tabname, Oid namespaceId,
  *
  * We know that less than NAMEDATALEN characters will actually be used,
  * so we can truncate the result once we've generated that many.
+ *
+ * XXX See also ChooseExtendedStatisticNameAddition.
  */
 static char *
 ChooseIndexNameAddition(List *colnames)
@@ -1686,9 +1723,9 @@ ChooseIndexColumnNames(List *indexElems)
 
 		/* Get the preliminary name from the IndexElem */
 		if (ielem->indexcolname)
-			origname = ielem->indexcolname;		/* caller-specified name */
+			origname = ielem->indexcolname; /* caller-specified name */
 		else if (ielem->name)
-			origname = ielem->name;		/* simple column reference */
+			origname = ielem->name; /* simple column reference */
 		else
 			origname = "expr";	/* default name for expression */
 

@@ -21,7 +21,7 @@
  * Postgres 9.2, this check is made automatically by the Makefile.)
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -342,6 +342,7 @@ greater_equals	">="
 less_greater	"<>"
 not_equals		"!="
 add_equals		"+="
+equals_tilde	"=~"
 
 /*
  * "self" is the set of chars that should be returned as single-character
@@ -367,6 +368,8 @@ operator		{op_chars}+
  * backup when the {real} rule fails to match completely.
  */
 
+hex				0[xX][0-9A-Fa-f]+
+hexfail			0[xX]
 integer			{digit}+
 decimal			(({digit}*\.{digit}+)|({digit}+\.{digit}*))
 decimalfail		{digit}+\.\.
@@ -862,6 +865,11 @@ other			.
 					return ADD_EQUALS;
 				}
 
+{equals_tilde}	{
+					SET_YYLLOC();
+					return EQUALS_TILDE;
+				}
+
 {self}			{
 					SET_YYLLOC();
 					return yytext[0];
@@ -949,6 +957,15 @@ other			.
 					return PARAM;
 				}
 
+{hex}			{
+					SET_YYLLOC();
+					return process_integer_literal(yytext, yylval);
+				}
+{hexfail}		{
+					yyless(yyleng - 1);
+					SET_YYLLOC();
+					return process_integer_literal(yytext, yylval);
+				}
 {integer}		{
 					SET_YYLLOC();
 					return process_integer_literal(yytext, yylval);
@@ -1239,7 +1256,7 @@ process_integer_literal(const char *token, YYSTYPE *lval)
 	char	   *endptr;
 
 	errno = 0;
-	val = strtol(token, &endptr, 10);
+	val = strtol(token, &endptr, 0);
 	if (*endptr != '\0' || errno == ERANGE
 #ifdef HAVE_LONG_INT_64
 	/* if long > 32 bits, check for overflow of int4 */

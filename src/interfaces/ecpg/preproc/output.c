@@ -32,7 +32,7 @@ struct when when_error,
 			when_warn;
 
 static void
-print_action(struct when * w)
+print_action(struct when *w)
 {
 	switch (w->code)
 	{
@@ -96,7 +96,7 @@ hashline_number(void)
 		)
 	{
 		/* "* 2" here is for escaping '\' and '"' below */
-		char	   *line = mm_alloc(strlen("\n#line %d \"%s\"\n") + sizeof(int) * CHAR_BIT * 10 / 3 + strlen(input_filename) *2);
+		char	   *line = mm_alloc(strlen("\n#line %d \"%s\"\n") + sizeof(int) * CHAR_BIT * 10 / 3 + strlen(input_filename) * 2);
 		char	   *src,
 				   *dest;
 
@@ -155,6 +155,7 @@ output_statement(char *stmt, int whenever_mode, enum ECPG_statement_type st)
 	free(stmt);
 	if (connection != NULL)
 		free(connection);
+	connection = NULL;
 }
 
 void
@@ -169,6 +170,7 @@ output_prepare_statement(char *name, char *stmt)
 	free(name);
 	if (connection != NULL)
 		free(connection);
+	connection = NULL;
 }
 
 void
@@ -189,6 +191,7 @@ output_deallocate_prepare_statement(char *name)
 	free(name);
 	if (connection != NULL)
 		free(connection);
+	connection = NULL;
 }
 
 static void
@@ -228,8 +231,8 @@ output_escaped_str(char *str, bool quoted)
 				j++;
 			} while (str[j] == ' ' || str[j] == '\t');
 
-			if ((str[j] != '\n') && (str[j] != '\r' || str[j + 1] != '\n'))		/* not followed by a
-																				 * newline */
+			if ((str[j] != '\n') && (str[j] != '\r' || str[j + 1] != '\n')) /* not followed by a
+																			 * newline */
 				fputs("\\\\", base_yyout);
 		}
 		else if (str[i] == '\r' && str[i + 1] == '\n')

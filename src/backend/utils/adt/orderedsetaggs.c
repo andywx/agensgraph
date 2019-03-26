@@ -3,7 +3,7 @@
  * orderedsetaggs.c
  *		Ordered-set aggregate functions.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include <float.h>
 #include <math.h>
 
 #include "catalog/pg_aggregate.h"
@@ -457,10 +458,9 @@ percentile_disc_final(PG_FUNCTION_ARGS)
 		elog(ERROR, "missing row in percentile_disc");
 
 	/*
-	 * Note: we *cannot* clean up the tuplesort object here, because the value
-	 * to be returned is allocated inside its sortcontext.  We could use
-	 * datumCopy to copy it out of there, but it doesn't seem worth the
-	 * trouble, since the cleanup callback will clear the tuplesort later.
+	 * Note: we could clean up the tuplesort object here, but it doesn't seem
+	 * worth the trouble, since the cleanup callback will clear the tuplesort
+	 * later.
 	 */
 
 	/* We shouldn't have stored any nulls, but do the right thing anyway */
@@ -575,10 +575,9 @@ percentile_cont_final_common(FunctionCallInfo fcinfo,
 	}
 
 	/*
-	 * Note: we *cannot* clean up the tuplesort object here, because the value
-	 * to be returned may be allocated inside its sortcontext.  We could use
-	 * datumCopy to copy it out of there, but it doesn't seem worth the
-	 * trouble, since the cleanup callback will clear the tuplesort later.
+	 * Note: we could clean up the tuplesort object here, but it doesn't seem
+	 * worth the trouble, since the cleanup callback will clear the tuplesort
+	 * later.
 	 */
 
 	PG_RETURN_DATUM(val);
@@ -1097,10 +1096,9 @@ mode_final(PG_FUNCTION_ARGS)
 		pfree(DatumGetPointer(last_val));
 
 	/*
-	 * Note: we *cannot* clean up the tuplesort object here, because the value
-	 * to be returned is allocated inside its sortcontext.  We could use
-	 * datumCopy to copy it out of there, but it doesn't seem worth the
-	 * trouble, since the cleanup callback will clear the tuplesort later.
+	 * Note: we could clean up the tuplesort object here, but it doesn't seem
+	 * worth the trouble, since the cleanup callback will clear the tuplesort
+	 * later.
 	 */
 
 	if (mode_freq)
@@ -1189,7 +1187,7 @@ hypothetical_rank_common(FunctionCallInfo fcinfo, int flag,
 	tuplesort_performsort(osastate->sortstate);
 
 	/* iterate till we find the hypothetical row */
-	while (tuplesort_gettupleslot(osastate->sortstate, true, slot, NULL))
+	while (tuplesort_gettupleslot(osastate->sortstate, true, true, slot, NULL))
 	{
 		bool		isnull;
 		Datum		d = slot_getattr(slot, nargs + 1, &isnull);
@@ -1352,7 +1350,8 @@ hypothetical_dense_rank_final(PG_FUNCTION_ARGS)
 	slot2 = extraslot;
 
 	/* iterate till we find the hypothetical row */
-	while (tuplesort_gettupleslot(osastate->sortstate, true, slot, &abbrevVal))
+	while (tuplesort_gettupleslot(osastate->sortstate, true, true, slot,
+								  &abbrevVal))
 	{
 		bool		isnull;
 		Datum		d = slot_getattr(slot, nargs + 1, &isnull);

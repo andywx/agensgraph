@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2017, PostgreSQL Global Development Group
  *
  * src/bin/psql/describe.h
  */
@@ -102,10 +102,22 @@ extern bool listExtensionContents(const char *pattern);
 /* \dy */
 extern bool listEventTriggers(const char *pattern, bool verbose);
 
+/* \dRp */
+bool		listPublications(const char *pattern);
+
+/* \dRp+ */
+bool		describePublications(const char *pattern);
+
+/* \dRs */
+bool		describeSubscriptions(const char *pattern, bool verbose);
+
 /* \dG */
 extern bool listGraphs(const char *pattern, bool verbose);
 
 /* \dGl, \dGv, \dGe */
 extern bool listLabels(const char *pattern, bool verbose, const char labkind);
 
-#endif   /* DESCRIBE_H */
+/* \dGi */
+extern bool listGraphIndexes(const char *pattern, bool verbose);
+
+#endif							/* DESCRIBE_H */

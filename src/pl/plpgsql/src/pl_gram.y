@@ -3,7 +3,7 @@
  *
  * pl_gram.y			- Parser for the PL/pgSQL procedural language
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,7 +13,7 @@
  *-------------------------------------------------------------------------
  */
 
-#include "plpgsql.h"
+#include "postgres.h"
 
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -22,6 +22,8 @@
 #include "parser/scanner.h"
 #include "parser/scansup.h"
 #include "utils/builtins.h"
+
+#include "plpgsql.h"
 
 
 /* Location tracking support --- simpler than bison's default */
@@ -110,6 +112,16 @@ static	void			check_raise_parameters(PLpgSQL_stmt_raise *stmt);
 
 static char *preserve_downcasing_ident(char *ident);
 
+/*
+ * for Cypher
+ */
+static	PLpgSQL_stmt	*make_execcypher_stmt(int firsttoken, int location);
+static	void			read_into_cypher_target(PLpgSQL_row **row, bool *strict);
+static	void			read_into_list(char *initial_name,
+									   PLpgSQL_datum *initial_datum,
+									   int initial_location,
+									   PLpgSQL_row **row);
+
 %}
 
 %expect 0
@@ -182,10 +194,11 @@ static char *preserve_downcasing_ident(char *ident);
 %type <expr>	expr_until_then expr_until_loop opt_expr_until_when
 %type <expr>	opt_exitcond
 
-%type <ival>	assign_var foreach_slice
+%type <datum>	assign_var
 %type <var>		cursor_variable
 %type <datum>	decl_cursor_arg
 %type <forvariable>	for_variable
+%type <ival>	foreach_slice
 %type <stmt>	for_control
 
 %type <str>		any_identifier opt_block_label opt_loop_label opt_label
@@ -211,7 +224,8 @@ static char *preserve_downcasing_ident(char *ident);
 %type <boolean>	getdiag_area_opt
 %type <list>	getdiag_list
 %type <diagitem> getdiag_list_item
-%type <ival>	getdiag_item getdiag_target
+%type <datum>	getdiag_target
+%type <ival>	getdiag_item
 
 %type <ival>	opt_scrollable
 %type <fetch>	opt_fetch_direction
@@ -296,8 +310,10 @@ static char *preserve_downcasing_ident(char *ident);
 %token <keyword>	K_INTO
 %token <keyword>	K_IS
 %token <keyword>	K_LAST
+%token <keyword>	K_LOAD
 %token <keyword>	K_LOG
 %token <keyword>	K_LOOP
+%token <keyword>	K_MATCH
 %token <keyword>	K_MESSAGE
 %token <keyword>	K_MESSAGE_TEXT
 %token <keyword>	K_MOVE
@@ -920,7 +936,7 @@ stmt_assign		: assign_var assign_operator expr_until_semi
 						new = palloc0(sizeof(PLpgSQL_stmt_assign));
 						new->cmd_type = PLPGSQL_STMT_ASSIGN;
 						new->lineno   = plpgsql_location_to_lineno(@1);
-						new->varno = $1;
+						new->varno = $1->dno;
 						new->expr  = $3;
 
 						$$ = (PLpgSQL_stmt *)new;
@@ -1018,7 +1034,7 @@ getdiag_list_item : getdiag_target assign_operator getdiag_item
 						PLpgSQL_diag_item *new;
 
 						new = palloc(sizeof(PLpgSQL_diag_item));
-						new->target = $1;
+						new->target = $1->dno;
 						new->kind = $3;
 
 						$$ = new;
@@ -1073,17 +1089,16 @@ getdiag_item :
 					}
 				;
 
-getdiag_target	: T_DATUM
+getdiag_target	: assign_var
 					{
-						check_assignable($1.datum, @1);
-						if ($1.datum->dtype == PLPGSQL_DTYPE_ROW ||
-							$1.datum->dtype == PLPGSQL_DTYPE_REC)
+						if ($1->dtype == PLPGSQL_DTYPE_ROW ||
+							$1->dtype == PLPGSQL_DTYPE_REC)
 							ereport(ERROR,
 									(errcode(ERRCODE_SYNTAX_ERROR),
 									 errmsg("\"%s\" is not a scalar variable",
-											NameOfDatum(&($1))),
+											((PLpgSQL_variable *) $1)->refname),
 									 parser_errposition(@1)));
-						$$ = $1.datum->dno;
+						$$ = $1;
 					}
 				| T_WORD
 					{
@@ -1101,7 +1116,7 @@ getdiag_target	: T_DATUM
 assign_var		: T_DATUM
 					{
 						check_assignable($1.datum, @1);
-						$$ = $1.datum->dno;
+						$$ = $1.datum;
 					}
 				| assign_var '[' expr_until_rightbracket
 					{
@@ -1110,13 +1125,13 @@ assign_var		: T_DATUM
 						new = palloc0(sizeof(PLpgSQL_arrayelem));
 						new->dtype		= PLPGSQL_DTYPE_ARRAYELEM;
 						new->subscript	= $3;
-						new->arrayparentno = $1;
+						new->arrayparentno = $1->dno;
 						/* initialize cached type data to "not valid" */
 						new->parenttypoid = InvalidOid;
 
 						plpgsql_adddatum((PLpgSQL_datum *) new);
 
-						$$ = new->dno;
+						$$ = (PLpgSQL_datum *) new;
 					}
 				;
 
@@ -1962,6 +1977,14 @@ stmt_execsql	: K_IMPORT
 							cword_is_not_variable(&($1), @1);
 						$$ = make_execsql_stmt(T_CWORD, @1);
 					}
+				| K_MATCH
+					{
+						$$ = make_execcypher_stmt(K_MATCH, @1);
+					}
+				| K_LOAD
+					{
+						$$ = make_execcypher_stmt(K_LOAD, @1);
+					}
 				;
 
 stmt_dynexecute : K_EXECUTE
@@ -2177,7 +2200,13 @@ stmt_null		: K_NULL ';'
 
 cursor_variable	: T_DATUM
 					{
-						if ($1.datum->dtype != PLPGSQL_DTYPE_VAR)
+						/*
+						 * In principle we should support a cursor_variable
+						 * that is an array element, but for now we don't, so
+						 * just throw an error if next token is '['.
+						 */
+						if ($1.datum->dtype != PLPGSQL_DTYPE_VAR ||
+							plpgsql_peek() == '[')
 							ereport(ERROR,
 									(errcode(ERRCODE_DATATYPE_MISMATCH),
 									 errmsg("cursor variable must be a simple variable"),
@@ -2434,7 +2463,9 @@ unreserved_keyword	:
 				| K_INSERT
 				| K_IS
 				| K_LAST
+				| K_LOAD
 				| K_LOG
+				| K_MATCH
 				| K_MESSAGE
 				| K_MESSAGE_TEXT
 				| K_MOVE
@@ -2863,11 +2894,11 @@ make_execsql_stmt(int firsttoken, int location)
 	 * clause lurking within it, and parse that via read_into_target().
 	 *
 	 * Because INTO is sometimes used in the main SQL grammar, we have to be
-	 * careful not to take any such usage of INTO as a pl/pgsql INTO clause.
+	 * careful not to take any such usage of INTO as a PL/pgSQL INTO clause.
 	 * There are currently three such cases:
 	 *
 	 * 1. SELECT ... INTO.  We don't care, we just override that with the
-	 * pl/pgsql definition.
+	 * PL/pgSQL definition.
 	 *
 	 * 2. INSERT INTO.  This is relatively easy to recognize since the words
 	 * must appear adjacently; but we can't assume INSERT starts the command,
@@ -4019,4 +4050,215 @@ preserve_downcasing_ident(char *ident)
 		ident = downcase_identifier(ident, strlen(ident), false, false);
 
 	return ident;
+}
+
+/*
+ * for Cypher
+ */
+/* see make_execsql_etmt() */
+static PLpgSQL_stmt *
+make_execcypher_stmt(int firsttoken, int location)
+{
+	StringInfoData		ds;
+	IdentifierLookup	save_IdentifierLookup;
+	PLpgSQL_stmt_execsql *execcypher;
+	PLpgSQL_expr		*expr;
+	PLpgSQL_row			*row = NULL;
+	int					tok;
+	bool				have_into = false;
+	bool				have_strict = false;
+	int					into_start_loc = -1;
+	int					into_end_loc = -1;
+
+	initStringInfo(&ds);
+
+	/* special lookup mode for identifiers within the SQL text */
+	save_IdentifierLookup = plpgsql_IdentifierLookup;
+	plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+
+	tok = firsttoken;
+	for (;;)
+	{
+		tok = yylex();
+		if (have_into && into_end_loc < 0)
+			into_end_loc = yylloc;		/* token after the INTO part */
+		if (tok == ';')
+			break;
+		if (tok == 0)
+			yyerror("unexpected end of function definition");
+		if (tok == K_INTO)
+		{
+			if (have_into)
+				yyerror("INTO specified more than once");
+			have_into = true;
+			into_start_loc = yylloc;
+			plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+			read_into_cypher_target(&row, &have_strict);
+			plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+		}
+	}
+
+	plpgsql_IdentifierLookup = save_IdentifierLookup;
+
+	if (have_into)
+	{
+		plpgsql_append_source_text(&ds, location, into_start_loc);
+		appendStringInfoSpaces(&ds, into_end_loc - into_start_loc);
+		plpgsql_append_source_text(&ds, into_end_loc, yylloc);
+	}
+	else
+		plpgsql_append_source_text(&ds, location, yylloc);
+
+	while (ds.len > 0 && scanner_isspace(ds.data[ds.len - 1]))
+		ds.data[--ds.len] = '\0';
+
+	expr = palloc0(sizeof(PLpgSQL_expr));
+	expr->dtype			= PLPGSQL_DTYPE_EXPR;
+	expr->query			= pstrdup(ds.data);
+	expr->plan			= NULL;
+	expr->paramnos		= NULL;
+	expr->rwparam		= -1;
+	expr->ns			= plpgsql_ns_top();
+	pfree(ds.data);
+
+	check_sql_expr(expr->query, location, 0);
+
+	execcypher = palloc(sizeof(PLpgSQL_stmt_execsql));
+	execcypher->cmd_type = PLPGSQL_STMT_EXECSQL;
+	execcypher->lineno   = plpgsql_location_to_lineno(location);
+	execcypher->sqlstmt  = expr;
+	execcypher->mod_stmt = false;
+	execcypher->into	 = have_into;
+	execcypher->strict	 = have_strict;
+	execcypher->rec	     = NULL;			/* At read_into_cypher_target(), only the rowtype is returned. */
+	execcypher->row	     = row;
+
+	return (PLpgSQL_stmt *) execcypher;
+}
+
+/* see read_into_target() */
+static void
+read_into_cypher_target(PLpgSQL_row **row, bool *strict)
+{
+	int			tok;
+
+	/* Set default results */
+	*row = NULL;
+	if (strict)
+		*strict = false;
+
+	tok = yylex();
+	if (strict && tok == K_STRICT)
+	{
+		*strict = true;
+		tok = yylex();
+	}
+
+	switch (tok)
+	{
+		case T_DATUM:
+			if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("record cannot be part of INTO list for cypher"),
+						 parser_errposition(yylloc)));
+			}
+			else
+			{
+				read_into_list(NameOfDatum(&(yylval.wdatum)),
+						yylval.wdatum.datum, yylloc,
+						row);
+			}
+			break;
+
+		default:
+			/* just to give a better message than "syntax error" */
+			current_token_is_not_variable(tok);
+	}
+}
+
+/*
+ * see read_into_scalar_list().
+ * read_into_scalar_list() makes result row that constructs an only scalar type.
+ * But, this function makes result row that constructs vertex, edge, graphpath and graphid.
+ */
+static void
+read_into_list(char *initial_name,
+			PLpgSQL_datum *initial_datum,
+			int initial_location,
+			PLpgSQL_row **row)
+{
+	int				 nfields;
+	char			*fieldnames[1024];
+	int				 varnos[1024];
+	PLpgSQL_row		*auxrow;
+	int				 tok;
+
+	*row = NULL;
+
+	check_assignable(initial_datum, initial_location);
+	fieldnames[0] = initial_name;
+	varnos[0]	  = initial_datum->dno;
+	nfields		  = 1;
+
+	while ((tok = yylex()) == ',')
+	{
+		/* Check for array overflow */
+		if (nfields >= 1024)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("too many INTO variables specified"),
+					 parser_errposition(yylloc)));
+
+		tok = yylex();
+		switch (tok)
+		{
+			case T_DATUM:
+				check_assignable(yylval.wdatum.datum, yylloc);
+
+				if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("record cannot be part of INTO list for cypher"),
+							 parser_errposition(yylloc)));
+				}
+				else
+				{
+					fieldnames[nfields] = NameOfDatum(&(yylval.wdatum));
+					varnos[nfields++]	= yylval.wdatum.datum->dno;
+				}
+				break;
+
+			default:
+				/* just to give a better message than "syntax error" */
+				current_token_is_not_variable(tok);
+		}
+	}
+
+	/*
+	 * We read an extra, non-comma token from yylex(), so push it
+	 * back onto the input stream
+	 */
+	plpgsql_push_back_token(tok);
+
+	auxrow = palloc(sizeof(PLpgSQL_row));
+	auxrow->dtype = PLPGSQL_DTYPE_ROW;
+	auxrow->refname = pstrdup("*internal*");
+	auxrow->lineno = plpgsql_location_to_lineno(initial_location);
+	auxrow->rowtupdesc = NULL;
+	auxrow->nfields = nfields;
+	auxrow->fieldnames = palloc(sizeof(char *) * nfields);
+	auxrow->varnos = palloc(sizeof(int) * nfields);
+	while (--nfields >= 0)
+	{
+		auxrow->fieldnames[nfields] = fieldnames[nfields];
+		auxrow->varnos[nfields] = varnos[nfields];
+	}
+
+	plpgsql_adddatum((PLpgSQL_datum *)auxrow);
+
+	/* result should not be rec */
+	*row = auxrow;
 }
