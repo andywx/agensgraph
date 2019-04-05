@@ -30,9 +30,10 @@ DoCopyRdf(CopyRdfStmt *stmt)
 
 {
 
-	freopen("../f1.txt","w",stdout);     //输出文件路径
+	freopen("/home/lpk/f1.txt","w",stdout);     //输出文件路径,需要根据本地用户实际路径修改
 	printf("%s\n",stmt->filename);
 	fclose(stdout);
+	
     return 0;
 
 }
