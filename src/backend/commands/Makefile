@@ -13,7 +13,7 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = amcmds.o aggregatecmds.o alter.o analyze.o async.o cluster.o comment.o \
-	collationcmds.o constraint.o conversioncmds.o copy.o createas.o \
+	collationcmds.o constraint.o conversioncmds.o copy.o copyrdf.o createas.o \
 	dbcommands.o define.o discard.o dropcmds.o \
 	event_trigger.o explain.o extension.o foreigncmds.o functioncmds.o \
 	graphcmds.o indexcmds.o lockcmds.o matview.o operatorcmds.o opclasscmds.o \
