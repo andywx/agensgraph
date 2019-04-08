@@ -34,6 +34,7 @@
 #include "commands/collationcmds.h"
 #include "commands/conversioncmds.h"
 #include "commands/copy.h"
+#include "commands/copyrdf.h"
 #include "commands/createas.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
@@ -563,6 +564,14 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			ExecuteTruncate((TruncateStmt *) parsetree);
 			break;
 
+		case T_CopyRdfStmt:
+			{
+				/*NOTE: Usage Forbidden should be considered in detail*/
+				DoCopyRdf((CopyRdfStmt *) parsetree);
+				printf("COPYRDF test");
+			}
+			break;
+			
 		case T_CopyStmt:
 			{
 				uint64		processed;
@@ -3078,6 +3087,10 @@ CreateCommandTag(Node *parsetree)
 				}
 			}
 			break;
+			
+		case T_CopyRdfStmt:
+			tag = "COPYRDF SUCCEED";
+			break;
 
 		default:
 			elog(WARNING, "unrecognized node type: %d",
@@ -3206,6 +3219,10 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_DDL;
 			break;
 
+		case T_CopyRdfStmt:
+			lev = LOGSTMT_MOD;
+			break;
+			
 		case T_CopyStmt:
 			if (((CopyStmt *) parsetree)->is_from)
 				lev = LOGSTMT_MOD;
@@ -3531,6 +3548,7 @@ GetCommandLogLevel(Node *parsetree)
 		case T_AlterPublicationStmt:
 			lev = LOGSTMT_DDL;
 			break;
+		
 
 		case T_CreateSubscriptionStmt:
 			lev = LOGSTMT_DDL;

@@ -266,7 +266,7 @@ static List *preserve_downcasing_type_func_namelist(List *namelist);
 		AlterRoleStmt AlterRoleSetStmt AlterPolicyStmt
 		AlterDefaultPrivilegesStmt DefACLAction
 		AnalyzeStmt ClosePortalStmt ClusterStmt CommentStmt
-		ConstraintsSetStmt CopyStmt CreateAsStmt CreateCastStmt
+		ConstraintsSetStmt CopyRdfStmt CopyStmt CreateAsStmt CreateCastStmt
 		CreateDomainStmt CreateExtensionStmt CreateGroupStmt CreateOpClassStmt
 		CreateOpFamilyStmt AlterOpFamilyStmt CreatePLangStmt
 		CreateSchemaStmt CreateSeqStmt CreateStmt CreateStatsStmt CreateTableSpaceStmt
@@ -708,7 +708,7 @@ static List *preserve_downcasing_type_func_namelist(List *namelist);
 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
 	CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 	COMMITTED CONCURRENTLY CONFIGURATION CONFLICT CONNECTION CONSTRAINT
-	CONSTRAINTS CONTAINS CONTENT_P CONTINUE_P CONVERSION_P COPY COST CREATE
+	CONSTRAINTS CONTAINS CONTENT_P CONTINUE_P CONVERSION_P COPY COPYRDF COST CREATE
 	CROSS CSV CUBE CURRENT_P
 	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
@@ -952,6 +952,7 @@ stmt :
 			| ClusterStmt
 			| CommentStmt
 			| ConstraintsSetStmt
+			| CopyRdfStmt
 			| CopyStmt
 			| CreateAmStmt
 			| CreateAsStmt
@@ -2908,6 +2909,23 @@ ClosePortalStmt:
 		;
 
 
+/*****************************************************************************
+ *
+ *		QUERY :
+ *				COPYRDF file
+ *
+ *****************************************************************************/
+
+CopyRdfStmt:	COPYRDF copy_file_name
+				{
+					CopyRdfStmt *n = makeNode(CopyRdfStmt);
+					n->filename = $2;
+					$$ = (Node *)n;
+				}
+		;		
+		
+		
+		
 /*****************************************************************************
  *
  *		QUERY :
@@ -14914,6 +14932,7 @@ unreserved_keyword:
 			| CONTINUE_P
 			| CONVERSION_P
 			| COPY
+			| COPYRDF
 			| COST
 			| CSV
 			| CUBE

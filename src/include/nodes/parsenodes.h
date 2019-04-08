@@ -1970,6 +1970,16 @@ typedef struct AlterDefaultPrivilegesStmt
 } AlterDefaultPrivilegesStmt;
 
 /* ----------------------
+ *		CopyRdf Statement
+ * ----------------------
+ */
+typedef struct CopyRdfStmt
+{
+	NodeTag		type;
+	char	   *filename;		/* filename, or NULL for STDIN/STDOUT */
+} CopyRdfStmt;
+
+/* ----------------------
  *		Copy Statement
  *
  * We support "COPY relation FROM file", "COPY relation TO file", and
