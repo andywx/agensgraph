@@ -2259,6 +2259,8 @@ _copyCypherTypeCast(const CypherTypeCast *from)
 
 	COPY_SCALAR_FIELD(type);
 	COPY_SCALAR_FIELD(cform);
+	COPY_SCALAR_FIELD(cctx);
+	COPY_SCALAR_FIELD(typcategory);
 	COPY_NODE_FIELD(arg);
 	COPY_LOCATION_FIELD(location);
 
@@ -5022,6 +5024,16 @@ _copyCypherLoadClause(const CypherLoadClause *from)
 	return newnode;
 }
 
+static CypherUnwindClause *
+_copyCypherUnwindClause(const CypherUnwindClause *from)
+{
+	CypherUnwindClause *newnode = makeNode(CypherUnwindClause);
+
+	COPY_NODE_FIELD(target);
+
+	return newnode;
+}
+
 static CypherPath *
 _copyCypherPath(const CypherPath *from)
 {
@@ -6217,6 +6229,9 @@ copyObjectImpl(const void *from)
 			break;
 		case T_CypherLoadClause:
 			retval = _copyCypherLoadClause(from);
+			break;
+		case T_CypherUnwindClause:
+			retval = _copyCypherUnwindClause(from);
 			break;
 		case T_CypherPath:
 			retval = _copyCypherPath(from);

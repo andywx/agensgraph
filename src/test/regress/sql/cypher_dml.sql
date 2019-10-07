@@ -1334,6 +1334,60 @@ RETURN properties(vt1);
 
 DROP GRAPH ag189 CASCADE;
 
+--
+-- UNWIND
+--
+
+UNWIND [1, 2, 3] AS i RETURN i;
+
+CREATE GRAPH test_unwind;
+CREATE ({a: [1, 2, 3]}), ({a: [4, 5, 6]});
+MATCH (n) WITH n.a AS a UNWIND a AS i RETURN *;
+DROP GRAPH test_unwind CASCADE;
+
+PREPARE t(_jsonb) AS UNWIND $1 AS i UNWIND i.a AS j UNWIND j AS k RETURN k;
+EXECUTE t(ARRAY['{"a": [[1, 2], [3, 4]]}'::jsonb,
+                '{"a": [[5, 6], [7, 8]]}'::jsonb]);
+DEALLOCATE t;
+
+-- LIMIT clause causes VLE relations to crash, issue AG-254
+
+CREATE GRAPH asterisk;
+
+CREATE VLABEL vertex;
+CREATE ELABEL edge;
+
+CREATE VLABEL city; -- additional VLABELs cause crashes (used or not)
+CREATE ELABEL road; -- additional ELABELs cause crashes (used or not)
+
+CREATE (a0:vertex {name: 'A'})
+CREATE (b0:vertex {name: 'B'})
+CREATE (q0:vertex {name: 'Q'})
+CREATE (x0:vertex {name: 'X'})
+MERGE (a0)-[:edge]->(b0)
+MERGE (q0)-[:edge]->(a0)
+MERGE (b0)-[:edge]->(q0)
+MERGE (a0)-[:edge]->(x0)
+MERGE (x0)-[:edge]->(b0);
+
+-- 4 row set
+MATCH p=((u:vertex {name: 'A'})-[*]->(v:vertex {name: 'B'}))
+RETURN p LIMIT 4; --crash
+
+-- 22 row set
+MATCH p=((u)-[*0..3]->(v)) RETURN p LIMIT 0; --no crash (nc)
+MATCH p=((u)-[*0..3]->(v)) RETURN p LIMIT 1; --nc
+MATCH p=((u)-[*0..3]->(v)) RETURN p LIMIT 4; --nc/memory corrupted (mem)
+MATCH p=((u)-[*0..3]->(v)) RETURN p LIMIT 5; --crash
+
+-- 18 row set
+MATCH p=((u)-[*..3]->(v)) RETURN p LIMIT 0; -- nc
+MATCH p=((u)-[*..3]->(v)) RETURN p LIMIT 1; -- nc
+MATCH p=((u)-[*..3]->(v)) RETURN p LIMIT 4; -- nc/mem
+MATCH p=((u)-[*..3]->(v)) RETURN p LIMIT 5; -- crash
+
+DROP GRAPH asterisk CASCADE;
+
 -- cleanup
 
 DROP GRAPH srf CASCADE;

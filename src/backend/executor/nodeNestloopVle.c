@@ -72,6 +72,8 @@ static void fetchOuterVars(NestLoopVLE *nlv, ExprContext *econtext,
 						  TupleTableSlot *outerTupleSlot, PlanState *innerPlan);
 /* result slot */
 static void adjustResult(NestLoopVLEState *node, TupleTableSlot *slot);
+/* cleanup */
+static void freePlanStateChgParam(PlanState *root);
 
 
 static TupleTableSlot *
@@ -534,6 +536,8 @@ void
 ExecEndNestLoopVLE(NestLoopVLEState *node)
 {
 	dlist_mutable_iter iter;
+	int			ctx_depth;
+	NestLoopVLE *nlv = (NestLoopVLE *) node->nls.js.ps.plan;
 
 	NLV1_printf("ExecEndNestLoopVLE: %s\n", "ending node processing");
 
@@ -565,12 +569,96 @@ ExecEndNestLoopVLE(NestLoopVLEState *node)
 	node->prev_ctx_node = &node->ctxs_head.head;
 
 	/*
+	 * Back out our context stack, if necessary. It is important to note that
+	 * the context depth is calculated ONLY to make it easier to follow. It is
+	 * built from the fact that curhops can start from 0 or 1 and that for
+	 * the first two increments, it does NOT push a context on the stack.
+	 * Note that negative values for depth equate to a depth of zero.
+	 *
+	 * Additionally, we need to free any chgParam BMSets that might have
+	 * been pending in the PlanState nodes.
+	 *
+	 * We do all of this because the LIMIT clause interrupts processing,
+	 * leaving the VLE contexts in incomplete states. This causes memory
+	 * issues that can crash the session.
+	 */
+
+	ctx_depth = node->curhops - (getInitialCurhops(nlv) + 1);
+	while (ctx_depth > 0)
+	{
+		freePlanStateChgParam(innerPlanState(node));
+		ExecPrevContext(innerPlanState(node));
+		ctx_depth--;
+	}
+
+	/*
 	 * close down subplans
 	 */
 	ExecEndNode(outerPlanState(node));
 	ExecEndNode(innerPlanState(node));
 
 	NLV1_printf("ExecEndNestLoopVLE: %s\n", "node processing ended");
+}
+
+/*
+ * Recursive function to decend a tree of PlanState nodes and free up
+ * their chgParam Bitmapsets.
+ */
+static void
+freePlanStateChgParam(PlanState *node)
+{
+	PlanState *ps;
+
+	/* base case, NULL leaf, nothing to do */
+	if (node == NULL)
+		return;
+
+	/* error out if the stack gets too deep */
+	check_stack_depth();
+
+	/* we need to deal with each case differently */
+	switch (nodeTag(node))
+	{
+		case T_SeqScanState:
+			ps = &((SeqScanState *) node)->ss.ps;
+			break;
+		case T_IndexScanState:
+			ps = &((IndexScanState *) node)->ss.ps;
+			break;
+		case T_IndexOnlyScanState:
+			ps = &((IndexOnlyScanState *) node)->ss.ps;
+			break;
+		case T_AppendState:
+			{
+				AppendState *as = (AppendState *) node;
+				int			i;
+
+				ps = &as->ps;
+				for (i = 0; i < as->as_nplans; i++)
+					freePlanStateChgParam(as->appendplans[i]);
+				break;
+			}
+		case T_ResultState:
+			ps = &((ResultState *) node)->ps;
+			break;
+		case T_NestLoopState:
+			ps = &((NestLoopState *) node)->js.ps;
+			break;
+		default:
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+			break;
+	}
+
+	/* recurse on the PlanState's children */
+	freePlanStateChgParam(ps->lefttree);
+	freePlanStateChgParam(ps->righttree);
+
+	/* if chgParam is not NULL, free it now */
+	if (ps->chgParam != NULL)
+	{
+		bms_free(ps->chgParam);
+		ps->chgParam = NULL;
+	}
 }
 
 /* ----------------------------------------------------------------

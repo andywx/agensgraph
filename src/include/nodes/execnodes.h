@@ -2179,6 +2179,10 @@ typedef struct Hash2SideState
 	double          totalPaths;
 	long            hops;
 	Size            spacePeak;
+	bool			isFieldSelect;	/* Track FieldSelect exprs */
+	Param		   *correctedParam;	/* Needed to correct FieldSelect exprs */
+	HeapTuple		vertexRow;		/* For reusing the vertexRow */
+	TupleDesc		tupleDesc;		/* Tuple descriptor for above vertexRow */
 } Hash2SideState;
 
 typedef struct ShortestpathState
@@ -2235,6 +2239,8 @@ typedef struct DijkstraState
 	Graphid 		target_id;
 	bool			is_executed;
 	TupleTableSlot *selfTupleSlot;
+	HeapTuple		vertexRow;		/* pointer to hold reusable vertex row */
+	TupleDesc		tupleDesc;		/* pointer to vertex row's tuple descr */
 } DijkstraState;
 
 #endif							/* EXECNODES_H */

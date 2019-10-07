@@ -822,6 +822,14 @@ _equalCypherTypeCast(const CypherTypeCast *a, const CypherTypeCast *b)
 {
 	COMPARE_SCALAR_FIELD(type);
 	COMPARE_COERCIONFORM_FIELD(cform);
+	/*
+	 * The following fields were purposely left out-
+	 *
+	 * cctx field is how the function came into existance. This is
+	 * unnecessary for comparisons.
+	 *
+	 * typcategory field is built from the type field - it's superfluous.
+	 */
 	COMPARE_NODE_FIELD(arg);
 	COMPARE_LOCATION_FIELD(location);
 
@@ -3176,6 +3184,15 @@ _equalCypherLoadClause(const CypherLoadClause *a, const CypherLoadClause *b)
 }
 
 static bool
+_equalCypherUnwindClause(const CypherUnwindClause *a,
+						 const CypherUnwindClause *b)
+{
+	COMPARE_NODE_FIELD(target);
+
+	return true;
+}
+
+static bool
 _equalCypherPath(const CypherPath *a, const CypherPath *b)
 {
 	COMPARE_SCALAR_FIELD(kind);
@@ -4165,6 +4182,9 @@ equal(const void *a, const void *b)
 			break;
 		case T_CypherLoadClause:
 			retval = _equalCypherLoadClause(a, b);
+			break;
+		case T_CypherUnwindClause:
+			retval = _equalCypherUnwindClause(a, b);
 			break;
 		case T_CypherPath:
 			retval = _equalCypherPath(a, b);
