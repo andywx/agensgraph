@@ -12,7 +12,7 @@ include $(top_builddir)/src/Makefile.global
 
 override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
-OBJS= analyze.o gram.o scan.o parser.o \
+OBJS= analyze.o gram.o uname_const_decl.o dkpool.o sparql_func.o sparql_p.o sparql_l.o  scan.o parser.o \
       parse_agg.o parse_clause.o parse_coerce.o parse_collate.o parse_cte.o \
       parse_enr.o parse_expr.o parse_func.o parse_node.o parse_oper.o \
       parse_param.o parse_relation.o parse_target.o parse_type.o \
@@ -36,20 +36,30 @@ include $(top_srcdir)/src/backend/common.mk
 gram.h: gram.c
 	touch $@
 
+sparql_p.h: sparql_p.c
+	touch $@
+
 gram.c: BISONFLAGS += -d
 gram.c: BISON_CHECK_CMD = $(PERL) $(srcdir)/check_keywords.pl $< $(top_srcdir)/src/include/parser/kwlist.h
-
 
 scan.c: FLEXFLAGS = -CF -p -p
 scan.c: FLEX_NO_BACKUP=yes
 scan.c: FLEX_FIX_WARNING=yes
 
 
+sparql_p.c:BISONFLAGS += -vd -psparyy 
+
+sparql_l.c: FLEXFLAGS = -Psparyy
+#sparql_l.c: FLEX_NO_BACKUP=yes
+#sparql_l.c: FLEX_FIX_WARNING=yes
+	
 # Force these dependencies to be known even without dependency info built:
 gram.o scan.o parser.o: gram.h
 
+sparql_p.o sparql_l.o: sparql_p.h
 
 # gram.c, gram.h, and scan.c are in the distribution tarball, so they
 # are not cleaned here.
+
 clean distclean maintainer-clean:
 	rm -f lex.backup

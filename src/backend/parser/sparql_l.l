@@ -34,11 +34,10 @@
 
 %{
 #include "Dk.h"
-#include "xmltree.h"
-#include "sparql.h"
+#include "sparql_l.h"
 #include "sparql_p.h"
-#include "numeric.h"
 #include "sparqlwords.h"
+#include "dkpool.h"
 
 struct yyguts_t;
 
